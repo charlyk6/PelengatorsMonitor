@@ -4,7 +4,7 @@ import time
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,21 +22,21 @@ TELEGRAM_BOT_TOKEN = "8628303688:AAFp0DQ19BIYo_g_Gfl2-9Sehhj_uQR82D4"
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
 
 (
+    USER_NAME,
     TYPE_NAME,
-    TYPE_BOARD,
-    TYPE_MIC,
-    TYPE_AXIS,
     TYPE_EDIT_VALUE,
     PEL_ID,
+    PEL_EDIT_VALUE,
     ERR_DESC,
     ERR_EDIT_DESC,
-) = range(8)
+) = range(7)
 
 TYPE_FIELD_PROMPTS = {
     "name": "Введите новое название:",
-    "board": "Введите новую плату:",
-    "mic_distance": "Введите расстояние между микрофонами:",
-    "axis_distance": "Введите расстояние между осями:",
+    **{
+        field: f"Введите: {label.lower()}:"
+        for field, label in storage.TEXT_FIELDS.items()
+    },
 }
 
 
@@ -79,7 +79,7 @@ async def render_screen(
     as_new: bool = False,
 ) -> None:
     if screen is None:
-        text, markup = screens.home_screen()
+        text, markup = _home(update)
         await render(update, "Запись не найдена.\n\n" + text, markup, as_new=as_new)
         return
     await render(update, *screen, as_new=as_new)
@@ -87,19 +87,47 @@ async def render_screen(
 
 async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await render(update, *screens.home_screen())
+    await render(update, *_home(update))
     return ConversationHandler.END
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await render(update, *screens.home_screen(), as_new=True)
+    user = update.effective_user
+    if user is None:
+        return ConversationHandler.END
+    db_user = storage.get_user(user.id)
+    if db_user is None:
+        await render(update, *screens.register_prompt(), as_new=True)
+        return USER_NAME
+    storage.update_user_username(user.id, user.username)
+    await render(update, *_home(update), as_new=True)
+    return ConversationHandler.END
+
+
+async def user_reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = _non_empty(update.message.text if update.message else None)
+    user = update.effective_user
+    if not name:
+        await render(update, *screens.register_prompt(), as_new=True)
+        return USER_NAME
+    if user is None:
+        return ConversationHandler.END
+    created, is_new = storage.register_user(user.id, name, user.username)
+    context.user_data.clear()
+    if is_new:
+        await notify_admins_new_user(context, created, except_id=user.id)
+    await render(update, *_home(update), as_new=True)
     return ConversationHandler.END
 
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await render(update, *screens.home_screen())
+    user = update.effective_user
+    if user is not None and storage.get_user(user.id) is None:
+        await render(update, *screens.register_prompt())
+        return USER_NAME
+    await render(update, *_home(update))
     return ConversationHandler.END
 
 
@@ -107,6 +135,88 @@ def _non_empty(text: str | None) -> str:
     return (text or "").strip()
 
 
+def _viewer_id(update: Update) -> int | None:
+    user = update.effective_user
+    return None if user is None else user.id
+
+
+def _is_admin(update: Update) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    db_user = storage.get_user(user.id)
+    return bool(db_user and db_user.get("role") == "admin")
+
+
+def _home(update: Update) -> tuple:
+    return screens.home_screen(is_admin=_is_admin(update))
+
+
+def _booking_label(update: Update) -> str:
+    user = update.effective_user
+    if user is None:
+        return "неизвестно"
+    db_user = storage.get_user(user.id)
+    if db_user is None:
+        return "неизвестно"
+    return storage.booking_label(db_user, user.username)
+
+
+def need_user(handler):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user is None or storage.get_user(user.id) is None:
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(
+                        "Сначала /start — укажите имя",
+                        show_alert=True,
+                    )
+                except BadRequest:
+                    pass
+                return USER_NAME
+            return await user_reg_name(update, context)
+        storage.update_user_username(user.id, user.username)
+        return await handler(update, context)
+
+    wrapped.__name__ = handler.__name__
+    return wrapped
+
+
+def _pel_card(update: Update, pelengator_id: int):
+    return screens.pelengator_card(
+        pelengator_id,
+        viewer_id=_viewer_id(update),
+        is_admin=_is_admin(update),
+    )
+
+
+async def notify_admins_new_user(
+    context: ContextTypes.DEFAULT_TYPE,
+    new_user: dict,
+    *,
+    except_id: int | None = None,
+) -> None:
+    nick = f"@{new_user['username']}" if new_user.get("username") else "—"
+    text = (
+        "Новая регистрация\n"
+        f"Имя: <b>{escape(new_user['name'])}</b>\n"
+        f"Ник: {escape(nick)}"
+    )
+    for admin in storage.list_admins():
+        if except_id is not None and admin["telegram_id"] == except_id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=admin["telegram_id"],
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            continue
+
+
+@need_user
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
     query = update.callback_query
     if query is None or not query.data:
@@ -124,6 +234,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if data == "nav:errs":
         await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
+    if data == "nav:users":
+        if not _is_admin(update):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return ConversationHandler.END
+        await render(update, *screens.users_screen())
+        return ConversationHandler.END
+    if data.startswith("usr:adm:"):
+        if not _is_admin(update):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return ConversationHandler.END
+        target_id = int(data.split(":")[2])
+        storage.set_user_role(target_id, "admin")
+        await query.answer("Теперь админ")
+        await render(update, *screens.users_screen())
+        return ConversationHandler.END
 
     if data.startswith("err:list:"):
         kind = screens.kind_from_code(data.split(":")[2])
@@ -138,6 +263,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if data.startswith("type:e:"):
         await render_screen(update, screens.type_edit_screen(int(data.split(":")[2])))
         return ConversationHandler.END
+    if data.startswith("type:tg:"):
+        _, _, type_id, field = data.split(":", 3)
+        storage.toggle_type_flag(int(type_id), field)
+        await render_screen(update, screens.type_edit_screen(int(type_id)))
+        return ConversationHandler.END
     if data.startswith("type:f:"):
         return await start_edit_type_field(update, context)
     if data.startswith("type:d:"):
@@ -147,7 +277,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         type_id = int(data.split(":")[2])
         error = storage.delete_type(type_id)
         await query.answer(
-            "Нельзя: тип используется" if error == "in_use" else "Тип удалён",
+            "Нельзя: шаблон используется" if error == "in_use" else "Шаблон удалён",
             show_alert=bool(error),
         )
         await render(update, *screens.types_screen())
@@ -159,14 +289,86 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             *screens.pelengator_pick_type_screen(
                 "pel:at:",
                 "nav:pels",
-                "Какой тип у нового пеленгатора?",
+                "Какой шаблон у нового пеленгатора?",
             ),
         )
         return ConversationHandler.END
     if data.startswith("pel:at:"):
         return await start_add_pelengator(update, context)
     if data.startswith("pel:v:"):
-        await render_screen(update, screens.pelengator_card(int(data.split(":")[2])))
+        await render_screen(update, _pel_card(update, int(data.split(":")[2])))
+        return ConversationHandler.END
+    if data.startswith("pel:pr:"):
+        await render_screen(update, screens.pel_props_screen(int(data.split(":")[2])))
+        return ConversationHandler.END
+    if data.startswith("pel:fg:"):
+        _, _, pelengator_id, field = data.split(":", 3)
+        storage.toggle_pelengator_flag(int(pelengator_id), field)
+        await render_screen(update, screens.pel_props_screen(int(pelengator_id)))
+        return ConversationHandler.END
+    if data.startswith("pel:tx:"):
+        return await start_edit_pel_field(update, context)
+    if data.startswith("pel:mv:"):
+        return await start_move_pelengator(update, context)
+    if data.startswith("pel:bk:"):
+        pelengator_id = int(data.split(":")[2])
+        user_id = _viewer_id(update)
+        if user_id is None:
+            await query.answer("Не удалось определить аккаунт")
+            return ConversationHandler.END
+        if _is_admin(update):
+            await render(update, *screens.pick_user_for_booking(pelengator_id))
+            return ConversationHandler.END
+        item = storage.get_pelengator(pelengator_id)
+        if item and item.get("reserved_user_id"):
+            await query.answer("Уже забронирован", show_alert=True)
+            await render_screen(update, _pel_card(update, pelengator_id))
+            return ConversationHandler.END
+        storage.reserve_pelengator(pelengator_id, user_id, _booking_label(update))
+        await query.answer("Забронировано на вас")
+        await render_screen(update, _pel_card(update, pelengator_id))
+        return ConversationHandler.END
+    if data.startswith("pel:bku:"):
+        if not _is_admin(update):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return ConversationHandler.END
+        _, _, pelengator_id, target_id = data.split(":")
+        pelengator_id = int(pelengator_id)
+        target_id = int(target_id)
+        target = storage.get_user(target_id)
+        if target is None:
+            await query.answer("Пользователь не найден", show_alert=True)
+            return ConversationHandler.END
+        storage.reserve_pelengator(
+            pelengator_id,
+            target_id,
+            storage.booking_label(target, target.get("username")),
+        )
+        await query.answer(f"Забронировано на {target['name']}")
+        await render_screen(update, _pel_card(update, pelengator_id))
+        return ConversationHandler.END
+    if data.startswith("pel:ub:"):
+        pelengator_id = int(data.split(":")[2])
+        user_id = _viewer_id(update)
+        if user_id is None:
+            await query.answer("Не удалось определить аккаунт")
+            return ConversationHandler.END
+        error = storage.release_pelengator(pelengator_id, user_id)
+        if error == "not_owner":
+            await query.answer("Это не ваша бронь", show_alert=True)
+        elif error == "not_reserved":
+            await query.answer("Пеленгатор уже свободен")
+        elif error:
+            await query.answer("Не удалось снять бронь", show_alert=True)
+        else:
+            await query.answer("Бронь снята")
+        await render_screen(update, _pel_card(update, pelengator_id))
+        return ConversationHandler.END
+    if data.startswith("pel:rs:"):
+        _, _, pelengator_id, field = data.split(":", 3)
+        storage.reset_pelengator_field(int(pelengator_id), field)
+        await query.answer("Вернул значение шаблона")
+        await render_screen(update, screens.pel_props_screen(int(pelengator_id)))
         return ConversationHandler.END
     if data.startswith("pel:ct:"):
         pelengator_id = int(data.split(":")[2])
@@ -175,15 +377,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             *screens.pelengator_pick_type_screen(
                 f"pel:st:{pelengator_id}:",
                 f"pel:v:{pelengator_id}",
-                f"Новый тип для пеленгатора #{pelengator_id}:",
+                f"Новый шаблон для пеленгатора #{pelengator_id}:",
             ),
         )
         return ConversationHandler.END
     if data.startswith("pel:st:"):
         _, _, pelengator_id, type_id = data.split(":")
         storage.update_pelengator_type(int(pelengator_id), int(type_id))
-        await query.answer("Тип обновлён")
-        await render_screen(update, screens.pelengator_card(int(pelengator_id)))
+        await query.answer("Шаблон обновлён")
+        await render_screen(update, _pel_card(update, int(pelengator_id)))
         return ConversationHandler.END
     if data.startswith("pel:d:"):
         await render_screen(
@@ -239,70 +441,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return None
 
 
+@need_user
 async def start_add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await render(update, *screens.prompt("Введите название типа:"))
+    await render(update, *screens.prompt("Введите название шаблона:"))
     return TYPE_NAME
 
 
 async def type_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = _non_empty(update.message.text if update.message else None)
     if not name:
-        await render(update, *screens.prompt("Название пустое. Введите название типа:"), as_new=True)
+        await render(
+            update,
+            *screens.prompt("Название пустое. Введите название шаблона:"),
+            as_new=True,
+        )
         return TYPE_NAME
-    context.user_data["type_name"] = name
-    await render(update, *screens.prompt("Введите плату:"), as_new=True)
-    return TYPE_BOARD
-
-
-async def type_board(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    board = _non_empty(update.message.text if update.message else None)
-    if not board:
-        await render(update, *screens.prompt("Плата пустая. Введите плату:"), as_new=True)
-        return TYPE_BOARD
-    context.user_data["type_board"] = board
-    await render(update, *screens.prompt("Введите расстояние между микрофонами:"), as_new=True)
-    return TYPE_MIC
-
-
-async def type_mic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    mic_distance = _non_empty(update.message.text if update.message else None)
-    if not mic_distance:
-        await render(
-            update,
-            *screens.prompt("Значение пустое. Введите расстояние между микрофонами:"),
-            as_new=True,
-        )
-        return TYPE_MIC
-    context.user_data["type_mic_distance"] = mic_distance
-    await render(update, *screens.prompt("Введите расстояние между осями:"), as_new=True)
-    return TYPE_AXIS
-
-
-async def type_axis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    axis_distance = _non_empty(update.message.text if update.message else None)
-    if not axis_distance:
-        await render(
-            update,
-            *screens.prompt("Значение пустое. Введите расстояние между осями:"),
-            as_new=True,
-        )
-        return TYPE_AXIS
-    type_id = storage.add_type(
-        name=context.user_data["type_name"],
-        board=context.user_data["type_board"],
-        mic_distance=context.user_data["type_mic_distance"],
-        axis_distance=axis_distance,
-    )
+    type_id = storage.add_type(name)
     context.user_data.clear()
     await render_screen(update, screens.type_card(type_id), as_new=True)
     return ConversationHandler.END
 
 
+@need_user
 async def start_edit_type_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    parts = update.callback_query.data.split(":")
-    type_id = int(parts[2])
-    field = parts[3]
+    _, _, type_id, field = update.callback_query.data.split(":", 3)
+    type_id = int(type_id)
     if field not in TYPE_FIELD_PROMPTS or storage.get_type(type_id) is None:
         await render(update, *screens.types_screen())
         return ConversationHandler.END
@@ -312,7 +476,7 @@ async def start_edit_type_field(update: Update, context: ContextTypes.DEFAULT_TY
     await render(
         update,
         *screens.prompt(
-            f"{TYPE_FIELD_PROMPTS[field]}\nСейчас: <code>{escape(str(current))}</code>"
+            f"{TYPE_FIELD_PROMPTS[field]}\nСейчас: <code>{escape(str(current) or '—')}</code>"
         ),
     )
     return TYPE_EDIT_VALUE
@@ -327,10 +491,73 @@ async def type_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return TYPE_EDIT_VALUE
     storage.update_type_field(type_id, field, value)
     context.user_data.clear()
-    await render_screen(update, screens.type_card(type_id), as_new=True)
+    await render_screen(update, screens.type_edit_screen(type_id), as_new=True)
     return ConversationHandler.END
 
 
+@need_user
+async def start_edit_pel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _, _, pelengator_id, field = update.callback_query.data.split(":", 3)
+    pelengator_id = int(pelengator_id)
+    item = storage.get_pelengator(pelengator_id)
+    if item is None or field not in storage.TEXT_FIELDS:
+        await render(update, *screens.pelengators_screen())
+        return ConversationHandler.END
+    context.user_data["edit_pel_id"] = pelengator_id
+    context.user_data["edit_pel_field"] = field
+    current = item["values"][field]
+    tpl_val = item.get("type_values", {}).get(field, "")
+    changed = current != tpl_val
+    suffix = "  ❗" if changed else ""
+    await render(
+        update,
+        *screens.prompt(
+            f"{TYPE_FIELD_PROMPTS[field]}\n"
+            f"Сейчас: <code>{escape(str(current) or '—')}</code>{suffix}"
+        ),
+    )
+    return PEL_EDIT_VALUE
+
+
+@need_user
+async def start_move_pelengator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    pelengator_id = int(update.callback_query.data.split(":")[2])
+    item = storage.get_pelengator(pelengator_id)
+    if item is None:
+        await render(update, *screens.pelengators_screen())
+        return ConversationHandler.END
+    context.user_data["edit_pel_id"] = pelengator_id
+    context.user_data["edit_pel_field"] = "location"
+    current = item.get("location") or "—"
+    await render(
+        update,
+        *screens.prompt(
+            f"Куда переместить пеленгатор <b>#{pelengator_id}</b>?\n"
+            f"Сейчас: <code>{escape(str(current))}</code>"
+        ),
+    )
+    return PEL_EDIT_VALUE
+
+
+async def pel_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = _non_empty(update.message.text if update.message else None)
+    pelengator_id = context.user_data.get("edit_pel_id")
+    field = context.user_data.get("edit_pel_field")
+    if not value or pelengator_id is None or field is None:
+        await render(update, *screens.prompt("Введите новое значение:"), as_new=True)
+        return PEL_EDIT_VALUE
+    if field == "location":
+        storage.set_pelengator_device_field(pelengator_id, field, value)
+        context.user_data.clear()
+        await render_screen(update, _pel_card(update, pelengator_id), as_new=True)
+        return ConversationHandler.END
+    storage.set_pelengator_text(pelengator_id, field, value)
+    context.user_data.clear()
+    await render_screen(update, screens.pel_props_screen(pelengator_id), as_new=True)
+    return ConversationHandler.END
+
+
+@need_user
 async def start_add_pelengator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     type_id = int(update.callback_query.data.split(":")[2])
     type_item = storage.get_type(type_id)
@@ -342,7 +569,7 @@ async def start_add_pelengator(update: Update, context: ContextTypes.DEFAULT_TYP
     await render(
         update,
         *screens.prompt(
-            f"Тип «{escape(type_item['name'])}».\nВведите уникальный id пеленгатора:"
+        f"Шаблон «{escape(type_item['name'])}».\nВведите уникальный id пеленгатора:"
         ),
     )
     return PEL_ID
@@ -352,7 +579,7 @@ async def pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = _non_empty(update.message.text if update.message else None)
     type_id = context.user_data.get("pelengator_type_id")
     if type_id is None:
-        await render(update, *screens.home_screen(), as_new=True)
+        await render(update, *_home(update), as_new=True)
         return ConversationHandler.END
     if not raw.isdigit():
         await render(update, *screens.prompt("id должен быть числом. Введите id:"), as_new=True)
@@ -369,10 +596,11 @@ async def pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await render(update, *screens.pelengators_screen(), as_new=True)
         return ConversationHandler.END
     context.user_data.clear()
-    await render_screen(update, screens.pelengator_card(int(raw)), as_new=True)
+    await render_screen(update, _pel_card(update, int(raw)), as_new=True)
     return ConversationHandler.END
 
 
+@need_user
 async def start_add_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     parts = update.callback_query.data.split(":")
     if parts[1] == "go":
@@ -404,7 +632,7 @@ async def err_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await render(update, *screens.prompt("Описание пустое. Напишите ошибку:"), as_new=True)
         return ERR_DESC
     if pelengator_id is None or kind is None:
-        await render(update, *screens.home_screen(), as_new=True)
+        await render(update, *_home(update), as_new=True)
         return ConversationHandler.END
     error_id = storage.add_error(pelengator_id, kind, description)
     context.user_data.clear()
@@ -415,6 +643,7 @@ async def err_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+@need_user
 async def start_edit_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     error_id = int(update.callback_query.data.split(":")[2])
     item = storage.get_error(error_id)
@@ -447,6 +676,23 @@ async def err_edit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 _last_network_log = 0.0
 
 
+@need_user
+async def open_pelengator_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Открывает карточку пеленгатора если пользователь отправил число."""
+    text = (update.message.text or "").strip()
+    if not text.isdigit():
+        return
+    pelengator_id = int(text)
+    item = storage.get_pelengator(pelengator_id)
+    if item is None:
+        await update.message.reply_text(
+            f"Пеленгатор <code>#{pelengator_id}</code> не найден.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await render_screen(update, _pel_card(update, pelengator_id), as_new=True)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     global _last_network_log
     error = context.error
@@ -477,21 +723,25 @@ def main() -> None:
 
     conversation = ConversationHandler(
         entry_points=[
+            CommandHandler("start", cmd_start),
             CallbackQueryHandler(start_add_type, pattern=r"^type:add$"),
             CallbackQueryHandler(start_edit_type_field, pattern=r"^type:f:"),
             CallbackQueryHandler(start_add_pelengator, pattern=r"^pel:at:"),
+            CallbackQueryHandler(start_edit_pel_field, pattern=r"^pel:tx:"),
+            CallbackQueryHandler(start_move_pelengator, pattern=r"^pel:mv:"),
             CallbackQueryHandler(start_add_error, pattern=r"^err:(k|go):"),
             CallbackQueryHandler(start_edit_error, pattern=r"^err:e:"),
         ],
         states={
+            USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_reg_name)],
             TYPE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, type_name)],
-            TYPE_BOARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, type_board)],
-            TYPE_MIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, type_mic)],
-            TYPE_AXIS: [MessageHandler(filters.TEXT & ~filters.COMMAND, type_axis)],
             TYPE_EDIT_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, type_edit_value)
             ],
             PEL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, pel_id)],
+            PEL_EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pel_edit_value)
+            ],
             ERR_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, err_desc)],
             ERR_EDIT_DESC: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, err_edit_desc)
@@ -508,6 +758,8 @@ def main() -> None:
     app.add_handler(conversation)
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(CommandHandler("start", cmd_start))
+    # Ввод числа вне диалога → открыть карточку пеленгатора
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_pelengator_by_id))
     app.add_error_handler(on_error)
 
     print("Бот запущен!")
