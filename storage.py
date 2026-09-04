@@ -45,12 +45,102 @@ FLAG_FIELDS = tuple(
     key for _title, flags in FLAG_GROUPS for key, _label in flags
 )
 
+HW_CLASSES = [
+    ("computer", "Вычислитель"),
+    ("aggregator", "Агрегатор"),
+    ("harness", "Шлейфы"),
+    ("mics", "Микрофоны"),
+    ("enclosure", "Гермобокс"),
+    ("comm", "Связь"),
+    ("modules", "Внешние модули"),
+    ("power", "Питание"),
+    ("construction", "Конструкция"),
+    ("other", "Другое"),
+]
+
+HW_CLASS_LABELS = {key: label for key, label in HW_CLASSES}
+
+HW_PARTS = {
+    "comm": list(FLAG_GROUPS[0][1]),
+    "modules": list(FLAG_GROUPS[1][1]),
+    "power": [
+        *FLAG_GROUPS[2][1],
+        ("power_transformer", "Трансформатор"),
+    ],
+    "construction": [
+        ("construction_legs", "Ножки"),
+        ("construction_mount", "Поворотное крепление"),
+        ("construction_pipes", "Трубы"),
+    ],
+}
+
+HW_PART_LABELS = {
+    key: label
+    for parts in HW_PARTS.values()
+    for key, label in parts
+}
+
+SW_CLASSES = [
+    ("os", "ОС"),
+    ("firmware", "Прошивка"),
+    ("loconst", "loconst"),
+    ("settings", "Настройки"),
+    ("allaproc", "allaproc"),
+    ("conn", "Соединения"),
+    ("gla", "Определение ГЛА"),
+    ("agent", "Агент"),
+    ("other", "Другое"),
+]
+
+SW_CLASS_LABELS = {key: label for key, label in SW_CLASSES}
+
+SW_PARTS = {
+    "conn": [
+        ("conn_vpn", "VPN"),
+        ("conn_ethernet", "Ethernet"),
+    ],
+}
+
+SW_PART_LABELS = {
+    key: label
+    for parts in SW_PARTS.values()
+    for key, label in parts
+}
+
+_HW_CLASS_RANK = {key: i for i, (key, _) in enumerate(HW_CLASSES)}
+_HW_PART_RANK = {
+    key: i
+    for parts in HW_PARTS.values()
+    for i, (key, _) in enumerate(parts)
+}
+_SW_CLASS_RANK = {key: i for i, (key, _) in enumerate(SW_CLASSES)}
+_SW_PART_RANK = {
+    key: i
+    for parts in SW_PARTS.values()
+    for i, (key, _) in enumerate(parts)
+}
+_KIND_RANK = {"hardware": 0, "soft": 1}
+
+ERROR_PRIORITIES = ("low", "medium", "critical")
+DEFAULT_PRIORITY = "medium"
+PRIORITY_EMOJI = {
+    "low": "🟢",
+    "medium": "🟡",
+    "critical": "🔴",
+}
+PRIORITY_LABELS = {
+    "low": "низкий",
+    "medium": "средний",
+    "critical": "критический",
+}
+
 # Поля устройства, не связанные с шаблоном
 DEVICE_FIELDS = {
     "location": "Местоположение",
     "reserved": "Бронь",
 }
 DEFAULT_LOCATION = "лаба"
+MAX_PELENGATOR_ID = 999_999_999
 
 
 def _connect() -> sqlite3.Connection:
@@ -116,6 +206,26 @@ def init_db() -> None:
             connection.execute(
                 "ALTER TABLE errors ADD COLUMN kind TEXT NOT NULL DEFAULT 'soft'"
             )
+        _ensure_column(connection, "errors", "hw_class", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "errors", "hw_part", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(
+            connection,
+            "errors",
+            "priority",
+            "TEXT NOT NULL DEFAULT 'medium'",
+        )
+        _ensure_column(
+            connection,
+            "errors",
+            "is_deleted",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            connection,
+            "users",
+            "status",
+            "TEXT NOT NULL DEFAULT 'active'",
+        )
 
         for name in TEXT_FIELDS:
             _ensure_column(
@@ -241,6 +351,7 @@ def list_pelengators() -> list[dict]:
                 (
                     SELECT COUNT(*) FROM errors
                     WHERE errors.pelengator_id = pelengators.id
+                      AND COALESCE(errors.is_deleted, 0) = 0
                 ) AS error_count
             FROM pelengators
             JOIN pelengator_types ON pelengator_types.id = pelengators.type_id
@@ -261,8 +372,20 @@ def list_pelengators() -> list[dict]:
     ]
 
 
+def parse_pelengator_id(raw: str) -> int | None:
+    text = (raw or "").strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if value < 1 or value > MAX_PELENGATOR_ID:
+        return None
+    return value
+
+
 def add_pelengator(pelengator_id: int, type_id: int) -> str | None:
     """Returns an error code or None on success."""
+    if pelengator_id < 1 or pelengator_id > MAX_PELENGATOR_ID:
+        return "invalid_id"
     with _lock:
         connection = _connect()
         tpl = connection.execute(
@@ -354,42 +477,84 @@ def get_pelengator(pelengator_id: int) -> dict | None:
     return item
 
 
+def _error_sort_key(item: dict) -> tuple:
+    kind = item.get("kind") or ""
+    kind_rank = _KIND_RANK.get(kind, 9)
+    class_key = item.get("hw_class") or ""
+    part_key = item.get("hw_part") or ""
+    if kind == "hardware":
+        class_rank = _HW_CLASS_RANK.get(class_key, len(_HW_CLASS_RANK))
+        part_rank = _HW_PART_RANK.get(part_key, len(_HW_PART_RANK))
+    else:
+        class_rank = _SW_CLASS_RANK.get(class_key, len(_SW_CLASS_RANK))
+        part_rank = _SW_PART_RANK.get(part_key, len(_SW_PART_RANK))
+    return (
+        kind_rank,
+        class_rank,
+        part_rank,
+        int(item["pelengator_id"]),
+        int(item["id"]),
+    )
+
+
+def _error_from_row(row: sqlite3.Row) -> dict:
+    keys = set(row.keys())
+    priority = "medium"
+    if "priority" in keys and row["priority"] in ERROR_PRIORITIES:
+        priority = str(row["priority"])
+    is_deleted = 0
+    if "is_deleted" in keys and row["is_deleted"] is not None:
+        is_deleted = int(row["is_deleted"])
+    return {
+        "id": row["id"],
+        "pelengator_id": row["pelengator_id"],
+        "kind": row["kind"],
+        "description": row["description"],
+        "hw_class": "" if "hw_class" not in keys or row["hw_class"] is None else str(row["hw_class"]),
+        "hw_part": "" if "hw_part" not in keys or row["hw_part"] is None else str(row["hw_part"]),
+        "priority": priority,
+        "is_deleted": is_deleted,
+    }
+
+
 def list_errors(kind: str | None = None) -> list[dict]:
     with _lock:
         connection = _connect()
         if kind is None:
             rows = connection.execute(
                 """
-                SELECT id, pelengator_id, kind, description
-                FROM errors
+                SELECT * FROM errors
+                WHERE COALESCE(is_deleted, 0) = 0
                 ORDER BY id
                 """
             ).fetchall()
         else:
             rows = connection.execute(
                 """
-                SELECT id, pelengator_id, kind, description
-                FROM errors
-                WHERE kind = ?
+                SELECT * FROM errors
+                WHERE kind = ? AND COALESCE(is_deleted, 0) = 0
                 ORDER BY id
                 """,
                 (kind,),
             ).fetchall()
         connection.close()
-    return [
-        {
-            "id": row["id"],
-            "pelengator_id": row["pelengator_id"],
-            "kind": row["kind"],
-            "description": row["description"],
-        }
-        for row in rows
-    ]
+    items = [_error_from_row(row) for row in rows]
+    items.sort(key=_error_sort_key)
+    return items
 
 
-def add_error(pelengator_id: int, kind: str, description: str) -> int | None:
+def add_error(
+    pelengator_id: int,
+    kind: str,
+    description: str,
+    hw_class: str = "",
+    hw_part: str = "",
+    priority: str = DEFAULT_PRIORITY,
+) -> int | None:
     if kind not in ("hardware", "soft"):
         return None
+    if priority not in ERROR_PRIORITIES:
+        priority = DEFAULT_PRIORITY
     with _lock:
         connection = _connect()
         pelengator = connection.execute(
@@ -399,12 +564,25 @@ def add_error(pelengator_id: int, kind: str, description: str) -> int | None:
         if pelengator is None:
             connection.close()
             return None
+        columns = _columns(connection, "errors")
+        fields = ["pelengator_id", "kind", "description"]
+        values: list[object] = [pelengator_id, kind, description]
+        if "hw_class" in columns:
+            fields.append("hw_class")
+            values.append(hw_class or "")
+        if "hw_part" in columns:
+            fields.append("hw_part")
+            values.append(hw_part or "")
+        if "priority" in columns:
+            fields.append("priority")
+            values.append(priority)
+        if "is_deleted" in columns:
+            fields.append("is_deleted")
+            values.append(0)
+        placeholders = ", ".join("?" for _ in fields)
         cursor = connection.execute(
-            """
-            INSERT INTO errors (pelengator_id, kind, description)
-            VALUES (?, ?, ?)
-            """,
-            (pelengator_id, kind, description),
+            f"INSERT INTO errors ({', '.join(fields)}) VALUES ({placeholders})",
+            values,
         )
         connection.commit()
         error_id = cursor.lastrowid
@@ -420,9 +598,9 @@ def counts() -> dict:
             SELECT
                 (SELECT COUNT(*) FROM pelengator_types) AS types,
                 (SELECT COUNT(*) FROM pelengators) AS pelengators,
-                (SELECT COUNT(*) FROM errors) AS errors,
-                (SELECT COUNT(*) FROM errors WHERE kind = 'hardware') AS hardware,
-                (SELECT COUNT(*) FROM errors WHERE kind = 'soft') AS soft
+                (SELECT COUNT(*) FROM errors WHERE COALESCE(is_deleted, 0) = 0) AS errors,
+                (SELECT COUNT(*) FROM errors WHERE kind = 'hardware' AND COALESCE(is_deleted, 0) = 0) AS hardware,
+                (SELECT COUNT(*) FROM errors WHERE kind = 'soft' AND COALESCE(is_deleted, 0) = 0) AS soft
             """
         ).fetchone()
         connection.close()
@@ -734,45 +912,32 @@ def list_errors_for_pelengator(pelengator_id: int) -> list[dict]:
         connection = _connect()
         rows = connection.execute(
             """
-            SELECT id, pelengator_id, kind, description
-            FROM errors
-            WHERE pelengator_id = ?
+            SELECT * FROM errors
+            WHERE pelengator_id = ? AND COALESCE(is_deleted, 0) = 0
             ORDER BY id
             """,
             (pelengator_id,),
         ).fetchall()
         connection.close()
-    return [
-        {
-            "id": row["id"],
-            "pelengator_id": row["pelengator_id"],
-            "kind": row["kind"],
-            "description": row["description"],
-        }
-        for row in rows
-    ]
+    items = [_error_from_row(row) for row in rows]
+    items.sort(key=_error_sort_key)
+    return items
 
 
 def get_error(error_id: int) -> dict | None:
     with _lock:
         connection = _connect()
         row = connection.execute(
-            """
-            SELECT id, pelengator_id, kind, description
-            FROM errors
-            WHERE id = ?
-            """,
+            "SELECT * FROM errors WHERE id = ?",
             (error_id,),
         ).fetchone()
         connection.close()
     if row is None:
         return None
-    return {
-        "id": row["id"],
-        "pelengator_id": row["pelengator_id"],
-        "kind": row["kind"],
-        "description": row["description"],
-    }
+    item = _error_from_row(row)
+    if item.get("is_deleted"):
+        return None
+    return item
 
 
 def update_error(
@@ -786,7 +951,7 @@ def update_error(
     with _lock:
         connection = _connect()
         row = connection.execute(
-            "SELECT id, kind, description FROM errors WHERE id = ?",
+            "SELECT * FROM errors WHERE id = ?",
             (error_id,),
         ).fetchone()
         if row is None:
@@ -794,10 +959,23 @@ def update_error(
             return False
         new_kind = kind if kind is not None else row["kind"]
         new_description = description if description is not None else row["description"]
-        connection.execute(
-            "UPDATE errors SET kind = ?, description = ? WHERE id = ?",
-            (new_kind, new_description, error_id),
-        )
+        keys = set(row.keys())
+        hw_class = row["hw_class"] if "hw_class" in keys and row["hw_class"] else ""
+        hw_part = row["hw_part"] if "hw_part" in keys and row["hw_part"] else ""
+        if "hw_class" in keys:
+            connection.execute(
+                """
+                UPDATE errors
+                SET kind = ?, description = ?, hw_class = ?, hw_part = ?
+                WHERE id = ?
+                """,
+                (new_kind, new_description, hw_class, hw_part, error_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE errors SET kind = ?, description = ? WHERE id = ?",
+                (new_kind, new_description, error_id),
+            )
         connection.commit()
         connection.close()
     return True
@@ -806,22 +984,60 @@ def update_error(
 def delete_error(error_id: int) -> bool:
     with _lock:
         connection = _connect()
-        cursor = connection.execute(
-            "DELETE FROM errors WHERE id = ?",
-            (error_id,),
-        )
+        columns = _columns(connection, "errors")
+        if "is_deleted" in columns:
+            cursor = connection.execute(
+                """
+                UPDATE errors
+                SET is_deleted = 1
+                WHERE id = ? AND COALESCE(is_deleted, 0) = 0
+                """,
+                (error_id,),
+            )
+        else:
+            cursor = connection.execute(
+                "DELETE FROM errors WHERE id = ?",
+                (error_id,),
+            )
         connection.commit()
         deleted = cursor.rowcount > 0
         connection.close()
     return deleted
 
 
+def set_error_priority(error_id: int, priority: str) -> bool:
+    if priority not in ERROR_PRIORITIES:
+        return False
+    with _lock:
+        connection = _connect()
+        if "priority" not in _columns(connection, "errors"):
+            connection.close()
+            return False
+        cursor = connection.execute(
+            """
+            UPDATE errors
+            SET priority = ?
+            WHERE id = ? AND COALESCE(is_deleted, 0) = 0
+            """,
+            (priority, error_id),
+        )
+        connection.commit()
+        updated = cursor.rowcount > 0
+        connection.close()
+    return updated
+
+
 def _user_from_row(row: sqlite3.Row) -> dict:
+    keys = set(row.keys())
+    status = "active"
+    if "status" in keys and row["status"]:
+        status = str(row["status"])
     return {
         "telegram_id": int(row["telegram_id"]),
         "name": str(row["name"] or ""),
         "username": str(row["username"] or ""),
         "role": str(row["role"] or "worker"),
+        "status": status,
     }
 
 
@@ -829,7 +1045,7 @@ def get_user(telegram_id: int) -> dict | None:
     with _lock:
         connection = _connect()
         row = connection.execute(
-            "SELECT telegram_id, name, username, role FROM users WHERE telegram_id = ?",
+            "SELECT * FROM users WHERE telegram_id = ?",
             (telegram_id,),
         ).fetchone()
         connection.close()
@@ -849,7 +1065,7 @@ def register_user(telegram_id: int, name: str, username: str | None) -> tuple[di
     with _lock:
         connection = _connect()
         existing = connection.execute(
-            "SELECT telegram_id, name, username, role FROM users WHERE telegram_id = ?",
+            "SELECT * FROM users WHERE telegram_id = ?",
             (telegram_id,),
         ).fetchone()
         if existing is not None:
@@ -859,19 +1075,24 @@ def register_user(telegram_id: int, name: str, username: str | None) -> tuple[di
             )
             connection.commit()
             row = connection.execute(
-                "SELECT telegram_id, name, username, role FROM users WHERE telegram_id = ?",
+                "SELECT * FROM users WHERE telegram_id = ?",
                 (telegram_id,),
             ).fetchone()
             connection.close()
             return _user_from_row(row), False
         total = connection.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         role = "admin" if total == 0 else "worker"
+        status = "active" if total == 0 else "pending"
+        fields = ["telegram_id", "name", "username", "role"]
+        values: list[object] = [telegram_id, name, nick, role]
+        columns = _columns(connection, "users")
+        if "status" in columns:
+            fields.append("status")
+            values.append(status)
+        placeholders = ", ".join("?" for _ in fields)
         connection.execute(
-            """
-            INSERT INTO users (telegram_id, name, username, role)
-            VALUES (?, ?, ?, ?)
-            """,
-            (telegram_id, name, nick, role),
+            f"INSERT INTO users ({', '.join(fields)}) VALUES ({placeholders})",
+            values,
         )
         connection.commit()
         connection.close()
@@ -881,9 +1102,38 @@ def register_user(telegram_id: int, name: str, username: str | None) -> tuple[di
             "name": name,
             "username": nick,
             "role": role,
+            "status": status,
         },
         True,
     )
+
+
+def update_user_name(telegram_id: int, name: str) -> bool:
+    name = name.strip()
+    if not name:
+        return False
+    with _lock:
+        connection = _connect()
+        cursor = connection.execute(
+            "UPDATE users SET name = ? WHERE telegram_id = ?",
+            (name, telegram_id),
+        )
+        if cursor.rowcount == 0:
+            connection.close()
+            return False
+        row = connection.execute(
+            "SELECT * FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        label = booking_label(_user_from_row(row))
+        if "reserved_user_id" in _columns(connection, "pelengators"):
+            connection.execute(
+                "UPDATE pelengators SET reserved = ? WHERE reserved_user_id = ?",
+                (label, telegram_id),
+            )
+        connection.commit()
+        connection.close()
+    return True
 
 
 def update_user_username(telegram_id: int, username: str | None) -> None:
@@ -903,7 +1153,7 @@ def list_users() -> list[dict]:
         connection = _connect()
         rows = connection.execute(
             """
-            SELECT telegram_id, name, username, role
+            SELECT *
             FROM users
             ORDER BY name COLLATE NOCASE, telegram_id
             """
@@ -917,9 +1167,9 @@ def list_admins() -> list[dict]:
         connection = _connect()
         rows = connection.execute(
             """
-            SELECT telegram_id, name, username, role
+            SELECT *
             FROM users
-            WHERE role = 'admin'
+            WHERE role = 'admin' AND (status = 'active' OR status IS NULL OR status = '')
             ORDER BY telegram_id
             """
         ).fetchall()
@@ -932,9 +1182,34 @@ def set_user_role(telegram_id: int, role: str) -> bool:
         return False
     with _lock:
         connection = _connect()
+        columns = _columns(connection, "users")
+        if role == "admin" and "status" in columns:
+            cursor = connection.execute(
+                "UPDATE users SET role = ?, status = 'active' WHERE telegram_id = ?",
+                (role, telegram_id),
+            )
+        else:
+            cursor = connection.execute(
+                "UPDATE users SET role = ? WHERE telegram_id = ?",
+                (role, telegram_id),
+            )
+        connection.commit()
+        updated = cursor.rowcount > 0
+        connection.close()
+    return updated
+
+
+def set_user_status(telegram_id: int, status: str) -> bool:
+    if status not in ("pending", "active", "blocked"):
+        return False
+    with _lock:
+        connection = _connect()
+        if "status" not in _columns(connection, "users"):
+            connection.close()
+            return False
         cursor = connection.execute(
-            "UPDATE users SET role = ? WHERE telegram_id = ?",
-            (role, telegram_id),
+            "UPDATE users SET status = ? WHERE telegram_id = ?",
+            (status, telegram_id),
         )
         connection.commit()
         updated = cursor.rowcount > 0

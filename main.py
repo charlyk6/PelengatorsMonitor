@@ -27,9 +27,11 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
     TYPE_EDIT_VALUE,
     PEL_ID,
     PEL_EDIT_VALUE,
+    ERR_PEL_ID,
     ERR_DESC,
     ERR_EDIT_DESC,
-) = range(7)
+    USER_EDIT_NAME,
+) = range(9)
 
 TYPE_FIELD_PROMPTS = {
     "name": "Введите новое название:",
@@ -101,6 +103,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await render(update, *screens.register_prompt(), as_new=True)
         return USER_NAME
     storage.update_user_username(user.id, user.username)
+    status = db_user.get("status") or "active"
+    if status == "pending":
+        await render(update, *screens.pending_screen(), as_new=True)
+        return ConversationHandler.END
+    if status == "blocked":
+        await render(update, *screens.blocked_screen(), as_new=True)
+        return ConversationHandler.END
     await render(update, *_home(update), as_new=True)
     return ConversationHandler.END
 
@@ -117,6 +126,9 @@ async def user_reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data.clear()
     if is_new:
         await notify_admins_new_user(context, created, except_id=user.id)
+        if created.get("status") == "pending":
+            await render(update, *screens.pending_screen(), as_new=True)
+            return ConversationHandler.END
     await render(update, *_home(update), as_new=True)
     return ConversationHandler.END
 
@@ -124,9 +136,18 @@ async def user_reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     user = update.effective_user
-    if user is not None and storage.get_user(user.id) is None:
-        await render(update, *screens.register_prompt())
-        return USER_NAME
+    if user is not None:
+        db_user = storage.get_user(user.id)
+        if db_user is None:
+            await render(update, *screens.register_prompt())
+            return USER_NAME
+        status = db_user.get("status") or "active"
+        if status == "pending":
+            await render(update, *screens.pending_screen())
+            return ConversationHandler.END
+        if status == "blocked":
+            await render(update, *screens.blocked_screen())
+            return ConversationHandler.END
     await render(update, *_home(update))
     return ConversationHandler.END
 
@@ -145,11 +166,25 @@ def _is_admin(update: Update) -> bool:
     if user is None:
         return False
     db_user = storage.get_user(user.id)
-    return bool(db_user and db_user.get("role") == "admin")
+    return bool(
+        db_user
+        and db_user.get("role") == "admin"
+        and (db_user.get("status") or "active") == "active"
+    )
 
 
 def _home(update: Update) -> tuple:
     return screens.home_screen(is_admin=_is_admin(update))
+
+
+def _profile(update: Update) -> tuple[str, object] | None:
+    user_id = _viewer_id(update)
+    if user_id is None:
+        return None
+    db_user = storage.get_user(user_id)
+    if db_user is None:
+        return None
+    return screens.profile_screen(db_user)
 
 
 def _booking_label(update: Update) -> str:
@@ -165,7 +200,8 @@ def _booking_label(update: Update) -> str:
 def need_user(handler):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if user is None or storage.get_user(user.id) is None:
+        db_user = None if user is None else storage.get_user(user.id)
+        if user is None or db_user is None:
             if update.callback_query:
                 try:
                     await update.callback_query.answer(
@@ -177,6 +213,26 @@ def need_user(handler):
                 return USER_NAME
             return await user_reg_name(update, context)
         storage.update_user_username(user.id, user.username)
+        status = db_user.get("status") or "active"
+        if status != "active":
+            screen = (
+                screens.pending_screen()
+                if status == "pending"
+                else screens.blocked_screen()
+            )
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(
+                        "Дождитесь подтверждения администратора"
+                        if status == "pending"
+                        else "Доступ заблокирован",
+                        show_alert=True,
+                    )
+                except BadRequest:
+                    pass
+                return ConversationHandler.END
+            await render(update, *screen, as_new=True)
+            return ConversationHandler.END
         return await handler(update, context)
 
     wrapped.__name__ = handler.__name__
@@ -201,8 +257,10 @@ async def notify_admins_new_user(
     text = (
         "Новая регистрация\n"
         f"Имя: <b>{escape(new_user['name'])}</b>\n"
-        f"Ник: {escape(nick)}"
+        f"Ник: {escape(nick)}\n\n"
+        "<i>Подтвердите доступ или заблокируйте.</i>"
     )
+    markup = screens.registration_review_markup(new_user["telegram_id"])
     for admin in storage.list_admins():
         if except_id is not None and admin["telegram_id"] == except_id:
             continue
@@ -210,10 +268,18 @@ async def notify_admins_new_user(
             await context.bot.send_message(
                 chat_id=admin["telegram_id"],
                 text=text,
+                reply_markup=markup,
                 parse_mode=ParseMode.HTML,
             )
         except (BadRequest, Forbidden, NetworkError, TimedOut):
             continue
+
+
+async def _notify_user(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, text: str) -> None:
+    try:
+        await context.bot.send_message(chat_id=telegram_id, text=text)
+    except (BadRequest, Forbidden, NetworkError, TimedOut):
+        return
 
 
 @need_user
@@ -225,6 +291,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     if data == "nav:home":
         return await show_home(update, context)
+    if data == "nav:profile":
+        await render_screen(update, _profile(update))
+        return ConversationHandler.END
+    if data == "me:name":
+        return await start_edit_own_name(update, context)
     if data == "nav:types":
         await render(update, *screens.types_screen())
         return ConversationHandler.END
@@ -238,7 +309,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         if not _is_admin(update):
             await query.answer("Недостаточно прав", show_alert=True)
             return ConversationHandler.END
-        await render(update, *screens.users_screen())
+        await render(update, *screens.users_screen(_viewer_id(update)))
         return ConversationHandler.END
     if data.startswith("usr:adm:"):
         if not _is_admin(update):
@@ -247,7 +318,50 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         target_id = int(data.split(":")[2])
         storage.set_user_role(target_id, "admin")
         await query.answer("Теперь админ")
-        await render(update, *screens.users_screen())
+        await render(update, *screens.users_screen(_viewer_id(update)))
+        return ConversationHandler.END
+    if data.startswith("usr:ok:") or data.startswith("usr:bl:") or data.startswith("usr:un:"):
+        if not _is_admin(update):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return ConversationHandler.END
+        action = data.split(":")[1]
+        target_id = int(data.split(":")[2])
+        viewer = _viewer_id(update)
+        if action == "bl" and viewer == target_id:
+            await query.answer("Нельзя заблокировать себя", show_alert=True)
+            return ConversationHandler.END
+        target = storage.get_user(target_id)
+        if target is None:
+            await query.answer("Пользователь не найден", show_alert=True)
+            return ConversationHandler.END
+        if action == "ok":
+            storage.set_user_status(target_id, "active")
+            await query.answer("Подтверждён")
+            await _notify_user(context, target_id, "Доступ подтверждён. Нажмите /start.")
+            result_label = "Подтверждён"
+        elif action == "bl":
+            storage.set_user_status(target_id, "blocked")
+            await query.answer("Заблокирован")
+            await _notify_user(context, target_id, "Доступ заблокирован.")
+            result_label = "Заблокирован"
+        else:
+            storage.set_user_status(target_id, "active")
+            await query.answer("Разблокирован")
+            await _notify_user(context, target_id, "Доступ восстановлен. Нажмите /start.")
+            result_label = "Разблокирован"
+        source_text = ""
+        if query.message is not None:
+            source_text = query.message.text or ""
+        if source_text.startswith("Новая регистрация"):
+            try:
+                await query.edit_message_text(
+                    f"{result_label}: <b>{escape(target['name'])}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return ConversationHandler.END
+            except BadRequest:
+                pass
+        await render(update, *screens.users_screen(_viewer_id(update)))
         return ConversationHandler.END
 
     if data.startswith("err:list:"):
@@ -297,6 +411,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return await start_add_pelengator(update, context)
     if data.startswith("pel:v:"):
         await render_screen(update, _pel_card(update, int(data.split(":")[2])))
+        return ConversationHandler.END
+    if data.startswith("pel:er:"):
+        await render_screen(update, screens.pel_errors_screen(int(data.split(":")[2])))
         return ConversationHandler.END
     if data.startswith("pel:pr:"):
         await render_screen(update, screens.pel_props_screen(int(data.split(":")[2])))
@@ -367,6 +484,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if data.startswith("pel:rs:"):
         _, _, pelengator_id, field = data.split(":", 3)
         storage.reset_pelengator_field(int(pelengator_id), field)
+        context.user_data.clear()
         await query.answer("Вернул значение шаблона")
         await render_screen(update, screens.pel_props_screen(int(pelengator_id)))
         return ConversationHandler.END
@@ -401,28 +519,60 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
 
     if data.startswith("err:add:"):
-        kind = screens.kind_from_code(data.split(":")[2])
-        await render(update, *screens.pick_pelengator_for_error(kind))
-        return ConversationHandler.END
+        return await start_pick_error_pelengator(update, context)
     if data.startswith("err:at:"):
         pelengator_id = int(data.split(":")[2])
         context.user_data["error_pelengator_id"] = pelengator_id
+        context.user_data["error_from_list"] = False
         await render(update, *screens.kind_screen(pelengator_id))
         return ConversationHandler.END
-    if data.startswith("err:k:") or data.startswith("err:go:"):
+    if data == "err:k:h" or data == "err:k:s" or data.startswith("err:go:"):
+        kind = "hardware" if data == "err:k:h" else "soft"
+        if data.startswith("err:go:"):
+            _, _, pelengator_id, kind_code = data.split(":")
+            context.user_data["error_pelengator_id"] = int(pelengator_id)
+            kind = screens.kind_from_code(kind_code)
+        pelengator_id = context.user_data.get("error_pelengator_id")
+        if pelengator_id is None:
+            await render(update, *screens.errors_hub_screen())
+            return ConversationHandler.END
+        context.user_data["error_kind"] = kind
+        back = (
+            f"err:add:{screens.kind_code(kind)}"
+            if context.user_data.get("error_from_list")
+            else f"err:at:{pelengator_id}"
+        )
+        await render(
+            update,
+            *screens.error_class_screen(int(pelengator_id), kind, back),
+        )
+        return ConversationHandler.END
+    if data.startswith("err:hw:") or data.startswith("err:sw:"):
+        class_key = data.split(":")[2]
+        kind = "hardware" if data.startswith("err:hw:") else "soft"
+        pelengator_id = context.user_data.get("error_pelengator_id")
+        if pelengator_id is None:
+            await render(update, *screens.errors_hub_screen())
+            return ConversationHandler.END
+        context.user_data["error_kind"] = kind
+        screen = screens.error_part_screen(int(pelengator_id), kind, class_key)
+        await render_screen(update, screen)
+        return ConversationHandler.END
+    if data.startswith("err:ds:"):
         return await start_add_error(update, context)
+    if data.startswith("err:np:"):
+        return await start_error_description(update, context)
+    if data.startswith("err:sp:"):
+        _, _, error_id, priority = data.split(":")
+        storage.set_error_priority(int(error_id), priority)
+        await query.answer("Приоритет обновлён")
+        await render_screen(update, screens.error_card(int(error_id)))
+        return ConversationHandler.END
     if data.startswith("err:v:"):
         await render_screen(update, screens.error_card(int(data.split(":")[2])))
         return ConversationHandler.END
     if data.startswith("err:e:"):
         return await start_edit_error(update, context)
-    if data.startswith("err:sk:"):
-        _, _, error_id, kind_code = data.split(":")
-        kind = "hardware" if kind_code == "h" else "soft"
-        storage.update_error(int(error_id), kind=kind)
-        await query.answer("Тип ошибки обновлён")
-        await render_screen(update, screens.error_card(int(error_id)))
-        return ConversationHandler.END
     if data.startswith("err:d:"):
         await render_screen(update, screens.confirm_delete_error(int(data.split(":")[2])))
         return ConversationHandler.END
@@ -432,7 +582,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         storage.delete_error(error_id)
         await query.answer("Ошибка удалена")
         if item:
-            await render(update, *screens.errors_screen(item["kind"]))
+            await render_screen(update, screens.pel_errors_screen(item["pelengator_id"]))
         else:
             await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
@@ -496,6 +646,39 @@ async def type_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 @need_user
+async def start_edit_own_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = _viewer_id(update)
+    db_user = None if user_id is None else storage.get_user(user_id)
+    if db_user is None:
+        await render(update, *screens.register_prompt())
+        return USER_NAME
+    current = db_user.get("name") or "—"
+    await render(
+        update,
+        *screens.prompt(f"Новое имя:\nСейчас: <code>{escape(current)}</code>"),
+    )
+    return USER_EDIT_NAME
+
+
+async def user_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = _non_empty(update.message.text if update.message else None)
+    user = update.effective_user
+    if not name:
+        await render(
+            update,
+            *screens.prompt("Имя пустое. Введите новое имя:"),
+            as_new=True,
+        )
+        return USER_EDIT_NAME
+    if user is None:
+        return ConversationHandler.END
+    storage.update_user_name(user.id, name)
+    context.user_data.clear()
+    await render_screen(update, _profile(update), as_new=True)
+    return ConversationHandler.END
+
+
+@need_user
 async def start_edit_pel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _, _, pelengator_id, field = update.callback_query.data.split(":", 3)
     pelengator_id = int(pelengator_id)
@@ -509,11 +692,13 @@ async def start_edit_pel_field(update: Update, context: ContextTypes.DEFAULT_TYP
     tpl_val = item.get("type_values", {}).get(field, "")
     changed = current != tpl_val
     suffix = "  ❗" if changed else ""
+    tpl_line = f"\nВ шаблоне: <code>{escape(str(tpl_val) or '—')}</code>"
     await render(
         update,
         *screens.prompt(
             f"{TYPE_FIELD_PROMPTS[field]}\n"
-            f"Сейчас: <code>{escape(str(current) or '—')}</code>{suffix}"
+            f"Сейчас: <code>{escape(str(current) or '—')}</code>{suffix}{tpl_line}",
+            reset_callback=f"pel:rs:{pelengator_id}:{field}",
         ),
     )
     return PEL_EDIT_VALUE
@@ -581,10 +766,17 @@ async def pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if type_id is None:
         await render(update, *_home(update), as_new=True)
         return ConversationHandler.END
-    if not raw.isdigit():
-        await render(update, *screens.prompt("id должен быть числом. Введите id:"), as_new=True)
+    pelengator_id = storage.parse_pelengator_id(raw)
+    if pelengator_id is None:
+        await render(
+            update,
+            *screens.prompt(
+                f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}. Введите id:"
+            ),
+            as_new=True,
+        )
         return PEL_ID
-    error = storage.add_pelengator(int(raw), type_id)
+    error = storage.add_pelengator(pelengator_id, type_id)
     if error == "duplicate_id":
         await render(
             update,
@@ -596,13 +788,61 @@ async def pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await render(update, *screens.pelengators_screen(), as_new=True)
         return ConversationHandler.END
     context.user_data.clear()
-    await render_screen(update, _pel_card(update, int(raw)), as_new=True)
+    await render_screen(update, _pel_card(update, pelengator_id), as_new=True)
+    return ConversationHandler.END
+
+
+@need_user
+async def start_pick_error_pelengator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    kind = screens.kind_from_code(update.callback_query.data.split(":")[2])
+    context.user_data["error_from_list"] = True
+    context.user_data["error_kind"] = kind
+    await render(update, *screens.pick_pelengator_for_error(kind))
+    if not storage.list_pelengators():
+        return ConversationHandler.END
+    return ERR_PEL_ID
+
+
+async def err_pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = _non_empty(update.message.text if update.message else None)
+    kind = context.user_data.get("error_kind")
+    if kind is None:
+        await render(update, *screens.errors_hub_screen(), as_new=True)
+        return ConversationHandler.END
+    pelengator_id = storage.parse_pelengator_id(raw)
+    if pelengator_id is None:
+        await render(
+            update,
+            *screens.prompt(
+                f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}. "
+                "Введите номер пеленгатора:"
+            ),
+            as_new=True,
+        )
+        return ERR_PEL_ID
+    if storage.get_pelengator(pelengator_id) is None:
+        await render(
+            update,
+            *screens.prompt(f"Пеленгатор #{pelengator_id} не найден. Введите другой id:"),
+            as_new=True,
+        )
+        return ERR_PEL_ID
+    context.user_data["error_pelengator_id"] = pelengator_id
+    await render(
+        update,
+        *screens.error_class_screen(
+            pelengator_id, kind, f"err:add:{screens.kind_code(kind)}"
+        ),
+        as_new=True,
+    )
     return ConversationHandler.END
 
 
 @need_user
 async def start_add_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     parts = update.callback_query.data.split(":")
+    hw_class = ""
+    hw_part = ""
     if parts[1] == "go":
         pelengator_id = int(parts[2])
         kind = screens.kind_from_code(parts[3])
@@ -610,15 +850,48 @@ async def start_add_error(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         kind = screens.kind_from_code(parts[2])
         pelengator_id = context.user_data.get("error_pelengator_id")
+        hw_class = parts[3] if len(parts) > 3 else ""
+        hw_part = parts[4] if len(parts) > 4 else ""
     if pelengator_id is None:
         await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
     context.user_data["error_kind"] = kind
-    label = screens.KIND_LABEL[kind]
+    context.user_data["error_hw_class"] = hw_class
+    context.user_data["error_hw_part"] = hw_part
+    category = screens.error_category_label(
+        {"kind": kind, "hw_class": hw_class, "hw_part": hw_part}
+    )
+    back = f"err:k:{screens.kind_code(kind)}"
+    await render(
+        update,
+        *screens.error_priority_screen(int(pelengator_id), category, back),
+    )
+    return ConversationHandler.END
+
+
+@need_user
+async def start_error_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    priority = update.callback_query.data.split(":")[2]
+    if priority not in storage.ERROR_PRIORITIES:
+        priority = storage.DEFAULT_PRIORITY
+    pelengator_id = context.user_data.get("error_pelengator_id")
+    kind = context.user_data.get("error_kind")
+    if pelengator_id is None or kind is None:
+        await render(update, *screens.errors_hub_screen())
+        return ConversationHandler.END
+    context.user_data["error_priority"] = priority
+    category = screens.error_category_label(
+        {
+            "kind": kind,
+            "hw_class": context.user_data.get("error_hw_class") or "",
+            "hw_part": context.user_data.get("error_hw_part") or "",
+        }
+    )
+    prio = screens.error_priority_text({"priority": priority})
     await render(
         update,
         *screens.prompt(
-            f"Пеленгатор #{pelengator_id}, {label}.\nОпишите ошибку:"
+            f"Пеленгатор #{pelengator_id}, {category}, {prio}.\nОпишите ошибку:"
         ),
     )
     return ERR_DESC
@@ -634,7 +907,14 @@ async def err_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if pelengator_id is None or kind is None:
         await render(update, *_home(update), as_new=True)
         return ConversationHandler.END
-    error_id = storage.add_error(pelengator_id, kind, description)
+    error_id = storage.add_error(
+        pelengator_id,
+        kind,
+        description,
+        hw_class=context.user_data.get("error_hw_class") or "",
+        hw_part=context.user_data.get("error_hw_part") or "",
+        priority=context.user_data.get("error_priority") or storage.DEFAULT_PRIORITY,
+    )
     context.user_data.clear()
     if error_id is None:
         await render(update, *screens.pelengators_screen(), as_new=True)
@@ -654,7 +934,7 @@ async def start_edit_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await render(
         update,
         *screens.prompt(
-            f"Новое описание ошибки #{error_id}.\n"
+            f"Новое описание ошибки.\n"
             f"Сейчас: {escape(item['description'])}"
         ),
     )
@@ -682,7 +962,12 @@ async def open_pelengator_by_id(update: Update, context: ContextTypes.DEFAULT_TY
     text = (update.message.text or "").strip()
     if not text.isdigit():
         return
-    pelengator_id = int(text)
+    pelengator_id = storage.parse_pelengator_id(text)
+    if pelengator_id is None:
+        await update.message.reply_text(
+            f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}.",
+        )
+        return
     item = storage.get_pelengator(pelengator_id)
     if item is None:
         await update.message.reply_text(
@@ -729,11 +1014,17 @@ def main() -> None:
             CallbackQueryHandler(start_add_pelengator, pattern=r"^pel:at:"),
             CallbackQueryHandler(start_edit_pel_field, pattern=r"^pel:tx:"),
             CallbackQueryHandler(start_move_pelengator, pattern=r"^pel:mv:"),
-            CallbackQueryHandler(start_add_error, pattern=r"^err:(k|go):"),
+            CallbackQueryHandler(start_pick_error_pelengator, pattern=r"^err:add:"),
+            CallbackQueryHandler(start_add_error, pattern=r"^err:ds:"),
+            CallbackQueryHandler(start_error_description, pattern=r"^err:np:"),
             CallbackQueryHandler(start_edit_error, pattern=r"^err:e:"),
+            CallbackQueryHandler(start_edit_own_name, pattern=r"^me:name$"),
         ],
         states={
             USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_reg_name)],
+            USER_EDIT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, user_edit_name)
+            ],
             TYPE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, type_name)],
             TYPE_EDIT_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, type_edit_value)
@@ -742,6 +1033,7 @@ def main() -> None:
             PEL_EDIT_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pel_edit_value)
             ],
+            ERR_PEL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, err_pel_id)],
             ERR_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, err_desc)],
             ERR_EDIT_DESC: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, err_edit_desc)

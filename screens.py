@@ -22,10 +22,44 @@ def kind_from_code(code: str) -> str:
     return "hardware" if code == "h" else "soft"
 
 
-TYPE_FIELDS = {
-    "name": "название",
-    **storage.TEXT_FIELDS,
-}
+def error_category_label(item: dict, *, short: bool = False) -> str:
+    kind = item.get("kind") or "soft"
+    class_key = item.get("hw_class") or ""
+    part_key = item.get("hw_part") or ""
+    if kind == "hardware":
+        class_label = storage.HW_CLASS_LABELS.get(class_key)
+        part_label = storage.HW_PART_LABELS.get(part_key)
+        kind_label = KIND_LABEL["hardware"]
+        kind_short = KIND_LABEL_SHORT["hardware"]
+    else:
+        class_label = storage.SW_CLASS_LABELS.get(class_key)
+        part_label = storage.SW_PART_LABELS.get(part_key)
+        kind_label = KIND_LABEL["soft"]
+        kind_short = KIND_LABEL_SHORT["soft"]
+    if short:
+        if part_label:
+            return part_label
+        if class_label:
+            return class_label
+        return kind_short
+    parts = [kind_label]
+    if class_label:
+        parts.append(class_label)
+    if part_label:
+        parts.append(part_label)
+    return " · ".join(parts)
+
+
+def error_priority_emoji(item: dict) -> str:
+    key = item.get("priority") or storage.DEFAULT_PRIORITY
+    return storage.PRIORITY_EMOJI.get(key, storage.PRIORITY_EMOJI[storage.DEFAULT_PRIORITY])
+
+
+def error_priority_text(item: dict) -> str:
+    key = item.get("priority") or storage.DEFAULT_PRIORITY
+    emoji = error_priority_emoji(item)
+    label = storage.PRIORITY_LABELS.get(key, key)
+    return f"{emoji} {label}"
 
 
 def _has_changes(values: dict, type_values: dict) -> bool:
@@ -109,7 +143,10 @@ def home_screen(is_admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
             _btn("Шаблоны", "nav:types"),
             _btn("Пеленгаторы", "nav:pels"),
         ],
-        [_btn("⚠️ Ошибки", "nav:errs")],
+        [
+            _btn("⚠️ Ошибки", "nav:errs"),
+            _btn("Профиль", "nav:profile"),
+        ],
     ]
     if is_admin:
         rows.append([_btn("Пользователи", "nav:users")])
@@ -278,25 +315,6 @@ def pelengator_card(
         *_hw_text_lines(item["values"], tv),
         "",
         *_hw_flag_lines(item["values"], tv),
-        "",
-        f"⚠️ <b>Ошибки</b> · {len(errors)}",
-    ]
-    for error in errors[-8:]:
-        kind = KIND_LABEL_SHORT.get(error["kind"], error["kind"])
-        lines.append(
-            f"  #{error['id']} {kind} — {escape(_short(error['description'], 48))}"
-        )
-    if len(errors) > 8:
-        lines.append(f"  … и ещё {len(errors) - 8}")
-
-    error_buttons = [
-        [
-            _btn(
-                f"#{error['id']} · {KIND_LABEL_SHORT.get(error['kind'], error['kind'])} · {_short(error['description'], 26)}",
-                f"err:v:{error['id']}",
-            )
-        ]
-        for error in errors[-5:]
     ]
     mine = (
         viewer_id is not None
@@ -315,12 +333,14 @@ def pelengator_card(
     keyboard_rows.extend(
         [
             [_btn("Свойства", f"pel:pr:{pelengator_id}")],
-            [_btn("➕ Добавить ошибку", f"err:at:{pelengator_id}")],
+            [
+                _btn(f"⚠️ Ошибки · {len(errors)}", f"pel:er:{pelengator_id}"),
+                _btn("➕ Добавить", f"err:at:{pelengator_id}"),
+            ],
             [
                 _btn("Сменить шаблон", f"pel:ct:{pelengator_id}"),
                 _btn("🗑 Удалить", f"pel:d:{pelengator_id}"),
             ],
-            *error_buttons,
             [_btn("← К пеленгаторам", "nav:pels")],
         ]
     )
@@ -328,38 +348,80 @@ def pelengator_card(
     return "\n".join(lines), keyboard
 
 
+def pel_errors_screen(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    item = storage.get_pelengator(pelengator_id)
+    if item is None:
+        return None
+    errors = storage.list_errors_for_pelengator(pelengator_id)
+    if errors:
+        text = (
+            f"⚠️ <b>Ошибки пеленгатора #{item['id']}</b>\n"
+            f"Всего: <b>{len(errors)}</b>"
+        )
+    else:
+        text = (
+            f"⚠️ <b>Ошибки пеленгатора #{item['id']}</b>\n"
+            "Пока чисто."
+        )
+    rows = [
+        [
+            _btn(
+                f"{error_priority_emoji(error)} {error_category_label(error, short=True)} · {_short(error['description'], 26)}",
+                f"err:v:{error['id']}",
+            )
+        ]
+        for error in errors
+    ]
+    rows.append([_btn("➕ Добавить ошибку", f"err:at:{pelengator_id}")])
+    rows.append([_btn("← К пеленгатору", f"pel:v:{pelengator_id}")])
+    return text, _markup(rows)
+
+
 def pel_props_screen(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     item = storage.get_pelengator(pelengator_id)
     if item is None:
         return None
-    tv = item.get("type_values")
-    lines = [
-        f"<b>Свойства пеленгатора #{item['id']}</b>",
-        f"Шаблон: <b>{escape(item['type_name'])}</b>",
-        "",
-        *_hw_text_lines(item["values"], tv),
-        "",
-        *_hw_flag_lines(item["values"], tv),
-        "",
-        "<i>❗ — отличается от шаблона. ↩ — сбросить к шаблону.</i>",
+    tv = item.get("type_values") or {}
+    values = item["values"]
+    text = (
+        f"✏️ <b>Пеленгатор #{item['id']}</b> — {escape(item['type_name'])}\n"
+        "<i>Нажмите поле для изменения. Галочки переключаются кнопкой.\n"
+        "❗ — отличается от шаблона.</i>"
+    )
+
+    text_pairs = [
+        ("mic_distance", "Микрофоны", "axis_distance", "Оси"),
+        ("computer", "Вычислитель", "aggregator", "Агрегатор"),
+        ("mic_count", "Кол-во микр.", "mic_carrier", "Носитель"),
     ]
-    rows = []
-    for field, label in storage.TEXT_FIELDS.items():
-        row = [_btn(label, f"pel:tx:{pelengator_id}:{field}")]
-        if tv is not None and item["values"].get(field) != tv.get(field):
-            row.append(_btn("↩", f"pel:rs:{pelengator_id}:{field}"))
-        rows.append(row)
+
+    def _changed_text(field: str) -> bool:
+        return values.get(field) != tv.get(field)
+
+    def _changed_flag(field: str) -> bool:
+        return bool(values.get(field)) != bool(tv.get(field))
+
+    def _text_btn(field: str, label: str):
+        mark = " ❗" if _changed_text(field) else ""
+        return _btn(f"{label}{mark}", f"pel:tx:{pelengator_id}:{field}")
+
+    rows = [
+        [_text_btn(left, left_label), _text_btn(right, right_label)]
+        for left, left_label, right, right_label in text_pairs
+    ]
     for title, flags in storage.FLAG_GROUPS:
         rows.append([_btn(f"── {title} ──", f"pel:pr:{pelengator_id}")])
+        flag_row = []
         for field, label in flags:
-            on = bool(item["values"][field])
-            mark = "✅" if on else "☐"
-            row = [_btn(f"{mark} {label}", f"pel:fg:{pelengator_id}:{field}")]
-            if tv is not None and bool(item["values"].get(field)) != bool(tv.get(field)):
-                row.append(_btn("↩", f"pel:rs:{pelengator_id}:{field}"))
-            rows.append(row)
+            mark = "✅" if values.get(field) else "☐"
+            suffix = " ❗" if _changed_flag(field) else ""
+            flag_row.append(
+                _btn(f"{mark} {label}{suffix}", f"pel:fg:{pelengator_id}:{field}")
+            )
+        rows.append(flag_row)
+
     rows.append([_btn("← К пеленгатору", f"pel:v:{pelengator_id}")])
-    return "\n".join(lines), _markup(rows)
+    return text, _markup(rows)
 
 
 def pelengator_pick_type_screen(
@@ -436,7 +498,7 @@ def errors_screen(kind: str) -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         [
             _btn(
-                f"#{item['id']} · пел.{item['pelengator_id']} · {_short(item['description'], 24)}",
+                f"{error_priority_emoji(item)} пел.{item['pelengator_id']} · {error_category_label(item, short=True)} · {_short(item['description'], 20)}",
                 f"err:v:{item['id']}",
             )
         ]
@@ -451,23 +513,28 @@ def error_card(error_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     item = storage.get_error(error_id)
     if item is None:
         return None
-    kind = KIND_LABEL.get(item["kind"], item["kind"])
-    other_kind = "soft" if item["kind"] == "hardware" else "hardware"
-    other_label = KIND_LABEL[other_kind]
+    category = error_category_label(item)
+    current = item.get("priority") or storage.DEFAULT_PRIORITY
     text = (
-        f"⚠️ <b>Ошибка #{item['id']}</b>\n\n"
+        f"⚠️ <b>Ошибка</b>\n\n"
         f"Пеленгатор: <code>{item['pelengator_id']}</code>\n"
-        f"Тип: <b>{kind}</b>\n\n"
+        f"Тип: <b>{category}</b>\n"
+        f"Приоритет: <b>{error_priority_text(item)}</b>\n\n"
         f"<b>Описание:</b>\n{escape(item['description'])}"
     )
+    prio_row = []
+    for key in storage.ERROR_PRIORITIES:
+        emoji = storage.PRIORITY_EMOJI[key]
+        mark = " ·" if key == current else ""
+        prio_row.append(_btn(f"{emoji}{mark}", f"err:sp:{error_id}:{key}"))
     keyboard = _markup(
         [
+            prio_row,
             [_btn("✏️ Изменить описание", f"err:e:{error_id}")],
-            [_btn(f"Сменить на {other_label}", f"err:sk:{error_id}:{other_kind[0]}")],
             [_btn("🗑 Удалить", f"err:d:{error_id}")],
             [
+                _btn("← К списку", f"pel:er:{item['pelengator_id']}"),
                 _btn("К пеленгатору", f"pel:v:{item['pelengator_id']}"),
-                _btn("← К списку", f"err:list:{kind_code(item['kind'])}"),
             ],
         ]
     )
@@ -478,7 +545,7 @@ def confirm_delete_error(error_id: int) -> tuple[str, InlineKeyboardMarkup] | No
     item = storage.get_error(error_id)
     if item is None:
         return None
-    text = f"🗑 Удалить ошибку <b>#{item['id']}</b>?"
+    text = "🗑 Удалить эту ошибку?"
     keyboard = _markup(
         [
             [
@@ -488,6 +555,101 @@ def confirm_delete_error(error_id: int) -> tuple[str, InlineKeyboardMarkup] | No
         ]
     )
     return text, keyboard
+
+
+def error_priority_screen(
+    pelengator_id: int,
+    category: str,
+    back: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        f"Пеленгатор <b>#{pelengator_id}</b>\n"
+        f"{escape(category)}\n\n"
+        "Какой приоритет?"
+    )
+    keyboard = _markup(
+        [
+            [
+                _btn("🟢 низкий", "err:np:low"),
+                _btn("🟡 средний", "err:np:medium"),
+                _btn("🔴 критический", "err:np:critical"),
+            ],
+            [_btn("← Назад", back)],
+        ]
+    )
+    return text, keyboard
+
+
+def error_class_screen(
+    pelengator_id: int, kind: str, back: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    if kind == "hardware":
+        title = "🔩 Ошибка железа"
+        classes = storage.HW_CLASSES
+        parts_map = storage.HW_PARTS
+        part_prefix = "err:hw:"
+        code = "h"
+    else:
+        title = "💾 Ошибка софта"
+        classes = storage.SW_CLASSES
+        parts_map = storage.SW_PARTS
+        part_prefix = "err:sw:"
+        code = "s"
+    text = (
+        f"{title} · пеленгатор <b>#{pelengator_id}</b>\n"
+        "Что сломалось?"
+    )
+    rows = []
+    row = []
+    for key, label in classes:
+        if key in parts_map:
+            callback = f"{part_prefix}{key}"
+        else:
+            callback = f"err:ds:{code}:{key}"
+        row.append(_btn(label, callback))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn("← Назад", back)])
+    return text, _markup(rows)
+
+
+def error_part_screen(
+    pelengator_id: int,
+    kind: str,
+    class_key: str,
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    if kind == "hardware":
+        parts = storage.HW_PARTS.get(class_key)
+        class_label = storage.HW_CLASS_LABELS.get(class_key, class_key)
+        code = "h"
+        back = "err:k:h"
+        icon = "🔩"
+    else:
+        parts = storage.SW_PARTS.get(class_key)
+        class_label = storage.SW_CLASS_LABELS.get(class_key, class_key)
+        code = "s"
+        back = "err:k:s"
+        icon = "💾"
+    if not parts:
+        return None
+    text = (
+        f"{icon} {escape(class_label)} · пеленгатор <b>#{pelengator_id}</b>\n"
+        "Уточните:"
+    )
+    rows = []
+    row = []
+    for key, label in parts:
+        row.append(_btn(label, f"err:ds:{code}:{class_key}:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn("← Назад", back)])
+    return text, _markup(rows)
 
 
 def kind_screen(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -513,41 +675,63 @@ def pick_pelengator_for_error(kind: str) -> tuple[str, InlineKeyboardMarkup]:
     if not items:
         text = "Сначала добавьте пеленгатор."
         return text, _markup([[_btn("К пеленгаторам", "nav:pels")]])
-    rows = [
-        [_btn(f"#{item['id']} · {_short(item['type_name'])}", f"err:go:{item['id']}:{kind_code(kind)}")]
-        for item in items
-    ]
-    rows.append([_btn("← Назад", f"err:list:{kind_code(kind)}")])
-    return f"Куда записать ошибку ({label})?", _markup(rows)
+    lines = [f"<b>Куда записать ошибку ({label})?</b>", ""]
+    for item in items:
+        loc = item.get("location") or "—"
+        lines.append(
+            f"<code>#{item['id']}</code> · {escape(_short(item['type_name'], 22))} · {escape(_short(loc, 20))}"
+        )
+    lines.append("")
+    lines.append("<i>Введите номер пеленгатора сообщением.</i>")
+    keyboard = _markup([[_btn("← Назад", f"err:list:{kind_code(kind)}")]])
+    return "\n".join(lines), keyboard
 
 
-def cancel_keyboard() -> InlineKeyboardMarkup:
+def cancel_keyboard(reset_callback: str | None = None) -> InlineKeyboardMarkup:
+    if reset_callback:
+        return _markup(
+            [[_btn("Сбросить", reset_callback), _btn("Отмена", "conv:cancel")]]
+        )
     return _markup([[_btn("Отмена", "conv:cancel")]])
 
 
-def users_screen() -> tuple[str, InlineKeyboardMarkup]:
+def users_screen(viewer_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
     users = storage.list_users()
     if users:
         lines = ["<b>Пользователи</b>", ""]
         for item in users:
             nick = f" (@{item['username']})" if item.get("username") else ""
-            lines.append(f"{escape(item['name'])}{escape(nick)}")
+            status = item.get("status") or "active"
+            extra = ""
+            if status == "pending":
+                extra = " — ожидает"
+            elif status == "blocked":
+                extra = " — заблокирован"
+            lines.append(f"{escape(item['name'])}{escape(nick)}{extra}")
         text = "\n".join(lines)
     else:
         text = "<b>Пользователи</b>\nПока никого нет."
 
     rows = []
     for item in users:
-        if item.get("role") == "admin":
-            continue
-        rows.append(
-            [
-                _btn(
-                    f"Сделать админом · {_short(item['name'], 22)}",
-                    f"usr:adm:{item['telegram_id']}",
-                )
-            ]
-        )
+        uid = item["telegram_id"]
+        name = _short(item["name"], 18)
+        status = item.get("status") or "active"
+        is_self = viewer_id is not None and uid == viewer_id
+        row = []
+        if status == "pending":
+            row.append(_btn(f"Подтвердить · {name}", f"usr:ok:{uid}"))
+            if not is_self:
+                row.append(_btn("Заблок.", f"usr:bl:{uid}"))
+        elif status == "blocked":
+            row.append(_btn(f"Разблок. · {name}", f"usr:un:{uid}"))
+        else:
+            if item.get("role") != "admin":
+                row.append(_btn(f"В админы · {name}", f"usr:adm:{uid}"))
+            if not is_self:
+                row.append(_btn("Заблок.", f"usr:bl:{uid}"))
+        if row:
+            rows.append(row)
     rows.append([_btn("← Меню", "nav:home")])
     return text, _markup(rows)
 
@@ -559,6 +743,8 @@ def pick_user_for_booking(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup
         return text, _markup([[_btn("← Назад", f"pel:v:{pelengator_id}")]])
     rows = []
     for item in users:
+        if item.get("status") and item["status"] != "active":
+            continue
         nick = f" @{item['username']}" if item.get("username") else ""
         rows.append(
             [
@@ -572,13 +758,68 @@ def pick_user_for_booking(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup
     return f"На кого забронировать пеленгатор <b>#{pelengator_id}</b>?", _markup(rows)
 
 
+ROLE_LABEL = {
+    "admin": "Администратор",
+    "worker": "Работник",
+}
+
+
+def profile_screen(user: dict) -> tuple[str, InlineKeyboardMarkup]:
+    role = ROLE_LABEL.get(user.get("role") or "worker", "Работник")
+    text = (
+        "<b>Профиль</b>\n\n"
+        f"<b>Имя:</b> {escape(user.get('name') or '—')}\n"
+        f"<b>Роль:</b> {escape(role)}"
+    )
+    keyboard = _markup(
+        [
+            [_btn("Сменить имя", "me:name")],
+            [_btn("← Меню", "nav:home")],
+        ]
+    )
+    return text, keyboard
+
+
 def register_prompt() -> tuple[str, None]:
     return (
         "Как вас зовут?\n\n"
-        "<i>Это имя будут видеть при бронировании.</i>",
+        "<i>Это имя будут видеть при бронировании.\n"
+        "После регистрации дождитесь подтверждения от администратора.</i>",
         None,
     )
 
 
-def prompt(text: str) -> tuple[str, InlineKeyboardMarkup]:
-    return f"{text}\n\n<i>Напишите ответ сообщением</i>", cancel_keyboard()
+def registration_review_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    return _markup(
+        [
+            [
+                _btn("Подтвердить", f"usr:ok:{telegram_id}"),
+                _btn("Заблокировать", f"usr:bl:{telegram_id}"),
+            ]
+        ]
+    )
+
+
+def pending_screen() -> tuple[str, None]:
+    return (
+        "Заявка отправлена.\n"
+        "Дождитесь подтверждения от администратора.",
+        None,
+    )
+
+
+def blocked_screen() -> tuple[str, None]:
+    return (
+        "Доступ заблокирован.\n"
+        "Если это ошибка — напишите администратору.",
+        None,
+    )
+
+
+def prompt(
+    text: str, reset_callback: str | None = None
+) -> tuple[str, InlineKeyboardMarkup]:
+    return (
+        f"{text}\n\n<i>Напишите ответ сообщением</i>",
+        cancel_keyboard(reset_callback),
+    )
