@@ -110,6 +110,16 @@ def _status_lines(item: dict) -> list[str]:
     ]
 
 
+def pel_id_link(bot_username: str | None, pelengator_id: int) -> str:
+    label = f"#{pelengator_id}"
+    if not bot_username:
+        return f"<code>{label}</code>"
+    return (
+        f'<a href="https://t.me/{bot_username}?start=p{pelengator_id}">'
+        f"{label}</a>"
+    )
+
+
 def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text, callback_data=data)
 
@@ -262,7 +272,7 @@ def confirm_delete_type(type_id: int) -> tuple[str, InlineKeyboardMarkup] | None
 # Пеленгаторы
 # ──────────────────────────────────────────
 
-def pelengators_screen() -> tuple[str, InlineKeyboardMarkup]:
+def pelengators_screen(bot_username: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
     items = storage.list_pelengators()
     if items:
         lines = ["<b>Пеленгаторы</b>", ""]
@@ -278,14 +288,14 @@ def pelengators_screen() -> tuple[str, InlineKeyboardMarkup]:
             loc = item.get("location") or "—"
             reserved = item.get("reserved") or ""
             lines.append(
-                f"<code>#{item['id']}</code> · {escape(_short(item['type_name'], 22))} · {escape(_short(loc, 20))}{err_part}{changed_mark}"
+                f"{pel_id_link(bot_username, item['id'])} · {escape(_short(item['type_name'], 22))} · {escape(_short(loc, 20))}{err_part}{changed_mark}"
             )
             if reserved:
                 lines.append(f"    ❌ {escape(reserved)}")
             else:
                 lines.append("    ✅ свободно")
         lines.append("")
-        lines.append("<i>Введите номер пеленгатора, чтобы открыть карточку.</i>")
+        lines.append("<i>Нажмите номер или введите его, чтобы открыть карточку.</i>")
         text = "\n".join(lines)
     else:
         text = "<b>Пеленгаторы</b>\nПока пусто — добавьте первое устройство."
@@ -481,10 +491,36 @@ def errors_hub_screen() -> tuple[str, InlineKeyboardMarkup]:
                 _btn(f"🔩 Железо · {stats['hardware']}", "err:list:h"),
                 _btn(f"💾 Софт · {stats['soft']}", "err:list:s"),
             ],
+            [_btn("Все ошибки", "err:all")],
             [_btn("← Меню", "nav:home")],
         ]
     )
     return text, keyboard
+
+
+def errors_all_screen() -> tuple[str, InlineKeyboardMarkup]:
+    items = storage.list_errors()
+    if items:
+        text = f"<b>Все ошибки</b>\nВсего: <b>{len(items)}</b>"
+    else:
+        text = "<b>Все ошибки</b>\nПока чисто."
+    rows = [
+        [
+            _btn(
+                f"{error_priority_emoji(item)} #{item['pelengator_id']} · {error_category_label(item, short=True)} · {_short(item['description'], 20)}",
+                f"err:v:{item['id']}",
+            )
+        ]
+        for item in items
+    ]
+    rows.append(
+        [
+            _btn("＋ Железо", "err:add:h"),
+            _btn("＋ Софт", "err:add:s"),
+        ]
+    )
+    rows.append([_btn("← К ошибкам", "nav:errs")])
+    return text, _markup(rows)
 
 
 def errors_screen(kind: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -533,8 +569,8 @@ def error_card(error_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
             [_btn("✏️ Изменить описание", f"err:e:{error_id}")],
             [_btn("🗑 Удалить", f"err:d:{error_id}")],
             [
-                _btn("← К списку", f"pel:er:{item['pelengator_id']}"),
                 _btn("К пеленгатору", f"pel:v:{item['pelengator_id']}"),
+                _btn("← Все ошибки", "err:all"),
             ],
         ]
     )
@@ -687,12 +723,15 @@ def pick_pelengator_for_error(kind: str) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), keyboard
 
 
-def cancel_keyboard(reset_callback: str | None = None) -> InlineKeyboardMarkup:
+def cancel_keyboard(
+    reset_callback: str | None = None,
+    back_callback: str = "conv:cancel",
+) -> InlineKeyboardMarkup:
+    row = []
     if reset_callback:
-        return _markup(
-            [[_btn("Сбросить", reset_callback), _btn("Отмена", "conv:cancel")]]
-        )
-    return _markup([[_btn("Отмена", "conv:cancel")]])
+        row.append(_btn("Сбросить", reset_callback))
+    row.append(_btn("Отмена", back_callback or "conv:cancel"))
+    return _markup([row])
 
 
 def users_screen(viewer_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
@@ -817,9 +856,11 @@ def blocked_screen() -> tuple[str, None]:
 
 
 def prompt(
-    text: str, reset_callback: str | None = None
+    text: str,
+    reset_callback: str | None = None,
+    back_callback: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     return (
         f"{text}\n\n<i>Напишите ответ сообщением</i>",
-        cancel_keyboard(reset_callback),
+        cancel_keyboard(reset_callback, back_callback or "conv:cancel"),
     )

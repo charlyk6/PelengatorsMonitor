@@ -2,7 +2,7 @@ from html import escape
 import os
 import time
 
-from telegram import Update
+from telegram import LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.ext import (
@@ -42,6 +42,9 @@ TYPE_FIELD_PROMPTS = {
 }
 
 
+_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
 async def render(
     update: Update,
     text: str,
@@ -59,6 +62,7 @@ async def render(
                 text,
                 reply_markup=markup,
                 parse_mode=ParseMode.HTML,
+                link_preview_options=_NO_PREVIEW,
             )
             return
         except BadRequest:
@@ -71,6 +75,7 @@ async def render(
         text,
         reply_markup=markup,
         parse_mode=ParseMode.HTML,
+        link_preview_options=_NO_PREVIEW,
     )
 
 
@@ -109,6 +114,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     if status == "blocked":
         await render(update, *screens.blocked_screen(), as_new=True)
+        return ConversationHandler.END
+    pelengator_id = _parse_start_pelengator_id(context)
+    if pelengator_id is not None:
+        screen = _pel_card(update, pelengator_id)
+        if screen is None:
+            await render(
+                update,
+                f"Пеленгатор <code>#{pelengator_id}</code> не найден.\n\n"
+                + _home(update)[0],
+                _home(update)[1],
+                as_new=True,
+            )
+        else:
+            await render_screen(update, screen, as_new=True)
         return ConversationHandler.END
     await render(update, *_home(update), as_new=True)
     return ConversationHandler.END
@@ -175,6 +194,37 @@ def _is_admin(update: Update) -> bool:
 
 def _home(update: Update) -> tuple:
     return screens.home_screen(is_admin=_is_admin(update))
+
+
+def _bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return (context.bot.username or "").lstrip("@")
+
+
+def _pels_screen(context: ContextTypes.DEFAULT_TYPE):
+    return screens.pelengators_screen(_bot_username(context))
+
+
+def _ask(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    reset_callback: str | None = None,
+) -> tuple[str, object]:
+    return screens.prompt(
+        text,
+        reset_callback=reset_callback,
+        back_callback=context.user_data.get("cancel_back"),
+    )
+
+
+def _parse_start_pelengator_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    args = context.args or []
+    if not args:
+        return None
+    raw = (args[0] or "").strip()
+    if len(raw) < 2 or raw[0] not in ("p", "P"):
+        return None
+    return storage.parse_pelengator_id(raw[1:])
 
 
 def _profile(update: Update) -> tuple[str, object] | None:
@@ -300,7 +350,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await render(update, *screens.types_screen())
         return ConversationHandler.END
     if data == "nav:pels":
-        await render(update, *screens.pelengators_screen())
+        await render(update, *_pels_screen(context))
         return ConversationHandler.END
     if data == "nav:errs":
         await render(update, *screens.errors_hub_screen())
@@ -367,6 +417,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if data.startswith("err:list:"):
         kind = screens.kind_from_code(data.split(":")[2])
         await render(update, *screens.errors_screen(kind))
+        return ConversationHandler.END
+    if data == "err:all":
+        await render(update, *screens.errors_all_screen())
         return ConversationHandler.END
 
     if data == "type:add":
@@ -515,7 +568,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         pelengator_id = int(data.split(":")[2])
         storage.delete_pelengator(pelengator_id)
         await query.answer("Пеленгатор удалён")
-        await render(update, *screens.pelengators_screen())
+        await render(update, *_pels_screen(context))
         return ConversationHandler.END
 
     if data.startswith("err:add:"):
@@ -582,7 +635,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         storage.delete_error(error_id)
         await query.answer("Ошибка удалена")
         if item:
-            await render_screen(update, screens.pel_errors_screen(item["pelengator_id"]))
+            await render(update, *screens.errors_all_screen())
         else:
             await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
@@ -594,7 +647,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 @need_user
 async def start_add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await render(update, *screens.prompt("Введите название шаблона:"))
+    context.user_data["cancel_back"] = "nav:types"
+    await render(update, *_ask(context, "Введите название шаблона:"))
     return TYPE_NAME
 
 
@@ -603,7 +657,7 @@ async def type_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not name:
         await render(
             update,
-            *screens.prompt("Название пустое. Введите название шаблона:"),
+            *_ask(context, "Название пустое. Введите название шаблона:"),
             as_new=True,
         )
         return TYPE_NAME
@@ -622,11 +676,13 @@ async def start_edit_type_field(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     context.user_data["edit_type_id"] = type_id
     context.user_data["edit_type_field"] = field
+    context.user_data["cancel_back"] = f"type:e:{type_id}"
     current = storage.get_type(type_id)[field]
     await render(
         update,
-        *screens.prompt(
-            f"{TYPE_FIELD_PROMPTS[field]}\nСейчас: <code>{escape(str(current) or '—')}</code>"
+        *_ask(
+            context,
+            f"{TYPE_FIELD_PROMPTS[field]}\nСейчас: <code>{escape(str(current) or '—')}</code>",
         ),
     )
     return TYPE_EDIT_VALUE
@@ -637,7 +693,7 @@ async def type_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     type_id = context.user_data.get("edit_type_id")
     field = context.user_data.get("edit_type_field")
     if not value or type_id is None or field is None:
-        await render(update, *screens.prompt("Введите новое значение:"), as_new=True)
+        await render(update, *_ask(context, "Введите новое значение:"), as_new=True)
         return TYPE_EDIT_VALUE
     storage.update_type_field(type_id, field, value)
     context.user_data.clear()
@@ -653,9 +709,10 @@ async def start_edit_own_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         await render(update, *screens.register_prompt())
         return USER_NAME
     current = db_user.get("name") or "—"
+    context.user_data["cancel_back"] = "nav:profile"
     await render(
         update,
-        *screens.prompt(f"Новое имя:\nСейчас: <code>{escape(current)}</code>"),
+        *_ask(context, f"Новое имя:\nСейчас: <code>{escape(current)}</code>"),
     )
     return USER_EDIT_NAME
 
@@ -666,7 +723,7 @@ async def user_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not name:
         await render(
             update,
-            *screens.prompt("Имя пустое. Введите новое имя:"),
+            *_ask(context, "Имя пустое. Введите новое имя:"),
             as_new=True,
         )
         return USER_EDIT_NAME
@@ -684,10 +741,11 @@ async def start_edit_pel_field(update: Update, context: ContextTypes.DEFAULT_TYP
     pelengator_id = int(pelengator_id)
     item = storage.get_pelengator(pelengator_id)
     if item is None or field not in storage.TEXT_FIELDS:
-        await render(update, *screens.pelengators_screen())
+        await render(update, *_pels_screen(context))
         return ConversationHandler.END
     context.user_data["edit_pel_id"] = pelengator_id
     context.user_data["edit_pel_field"] = field
+    context.user_data["cancel_back"] = f"pel:pr:{pelengator_id}"
     current = item["values"][field]
     tpl_val = item.get("type_values", {}).get(field, "")
     changed = current != tpl_val
@@ -695,7 +753,8 @@ async def start_edit_pel_field(update: Update, context: ContextTypes.DEFAULT_TYP
     tpl_line = f"\nВ шаблоне: <code>{escape(str(tpl_val) or '—')}</code>"
     await render(
         update,
-        *screens.prompt(
+        *_ask(
+            context,
             f"{TYPE_FIELD_PROMPTS[field]}\n"
             f"Сейчас: <code>{escape(str(current) or '—')}</code>{suffix}{tpl_line}",
             reset_callback=f"pel:rs:{pelengator_id}:{field}",
@@ -709,16 +768,18 @@ async def start_move_pelengator(update: Update, context: ContextTypes.DEFAULT_TY
     pelengator_id = int(update.callback_query.data.split(":")[2])
     item = storage.get_pelengator(pelengator_id)
     if item is None:
-        await render(update, *screens.pelengators_screen())
+        await render(update, *_pels_screen(context))
         return ConversationHandler.END
     context.user_data["edit_pel_id"] = pelengator_id
     context.user_data["edit_pel_field"] = "location"
+    context.user_data["cancel_back"] = f"pel:v:{pelengator_id}"
     current = item.get("location") or "—"
     await render(
         update,
-        *screens.prompt(
+        *_ask(
+            context,
             f"Куда переместить пеленгатор <b>#{pelengator_id}</b>?\n"
-            f"Сейчас: <code>{escape(str(current))}</code>"
+            f"Сейчас: <code>{escape(str(current))}</code>",
         ),
     )
     return PEL_EDIT_VALUE
@@ -729,7 +790,7 @@ async def pel_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     pelengator_id = context.user_data.get("edit_pel_id")
     field = context.user_data.get("edit_pel_field")
     if not value or pelengator_id is None or field is None:
-        await render(update, *screens.prompt("Введите новое значение:"), as_new=True)
+        await render(update, *_ask(context, "Введите новое значение:"), as_new=True)
         return PEL_EDIT_VALUE
     if field == "location":
         storage.set_pelengator_device_field(pelengator_id, field, value)
@@ -751,10 +812,12 @@ async def start_add_pelengator(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     context.user_data.clear()
     context.user_data["pelengator_type_id"] = type_id
+    context.user_data["cancel_back"] = "pel:add"
     await render(
         update,
-        *screens.prompt(
-        f"Шаблон «{escape(type_item['name'])}».\nВведите уникальный id пеленгатора:"
+        *_ask(
+            context,
+            f"Шаблон «{escape(type_item['name'])}».\nВведите уникальный id пеленгатора:",
         ),
     )
     return PEL_ID
@@ -770,8 +833,9 @@ async def pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if pelengator_id is None:
         await render(
             update,
-            *screens.prompt(
-                f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}. Введите id:"
+            *_ask(
+                context,
+                f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}. Введите id:",
             ),
             as_new=True,
         )
@@ -780,12 +844,12 @@ async def pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if error == "duplicate_id":
         await render(
             update,
-            *screens.prompt(f"id {raw} уже занят. Введите другой:"),
+            *_ask(context, f"id {raw} уже занят. Введите другой:"),
             as_new=True,
         )
         return PEL_ID
     if error:
-        await render(update, *screens.pelengators_screen(), as_new=True)
+        await render(update, *_pels_screen(context), as_new=True)
         return ConversationHandler.END
     context.user_data.clear()
     await render_screen(update, _pel_card(update, pelengator_id), as_new=True)
@@ -797,6 +861,7 @@ async def start_pick_error_pelengator(update: Update, context: ContextTypes.DEFA
     kind = screens.kind_from_code(update.callback_query.data.split(":")[2])
     context.user_data["error_from_list"] = True
     context.user_data["error_kind"] = kind
+    context.user_data["cancel_back"] = f"err:list:{screens.kind_code(kind)}"
     await render(update, *screens.pick_pelengator_for_error(kind))
     if not storage.list_pelengators():
         return ConversationHandler.END
@@ -813,9 +878,10 @@ async def err_pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if pelengator_id is None:
         await render(
             update,
-            *screens.prompt(
+            *_ask(
+                context,
                 f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}. "
-                "Введите номер пеленгатора:"
+                "Введите номер пеленгатора:",
             ),
             as_new=True,
         )
@@ -823,7 +889,7 @@ async def err_pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if storage.get_pelengator(pelengator_id) is None:
         await render(
             update,
-            *screens.prompt(f"Пеленгатор #{pelengator_id} не найден. Введите другой id:"),
+            *_ask(context, f"Пеленгатор #{pelengator_id} не найден. Введите другой id:"),
             as_new=True,
         )
         return ERR_PEL_ID
@@ -880,6 +946,10 @@ async def start_error_description(update: Update, context: ContextTypes.DEFAULT_
         await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
     context.user_data["error_priority"] = priority
+    if context.user_data.get("error_from_list"):
+        context.user_data["cancel_back"] = "err:all"
+    else:
+        context.user_data["cancel_back"] = f"pel:v:{pelengator_id}"
     category = screens.error_category_label(
         {
             "kind": kind,
@@ -890,8 +960,9 @@ async def start_error_description(update: Update, context: ContextTypes.DEFAULT_
     prio = screens.error_priority_text({"priority": priority})
     await render(
         update,
-        *screens.prompt(
-            f"Пеленгатор #{pelengator_id}, {category}, {prio}.\nОпишите ошибку:"
+        *_ask(
+            context,
+            f"Пеленгатор #{pelengator_id}, {category}, {prio}.\nОпишите ошибку:",
         ),
     )
     return ERR_DESC
@@ -902,7 +973,7 @@ async def err_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     pelengator_id = context.user_data.get("error_pelengator_id")
     kind = context.user_data.get("error_kind")
     if not description:
-        await render(update, *screens.prompt("Описание пустое. Напишите ошибку:"), as_new=True)
+        await render(update, *_ask(context, "Описание пустое. Напишите ошибку:"), as_new=True)
         return ERR_DESC
     if pelengator_id is None or kind is None:
         await render(update, *_home(update), as_new=True)
@@ -917,7 +988,7 @@ async def err_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     context.user_data.clear()
     if error_id is None:
-        await render(update, *screens.pelengators_screen(), as_new=True)
+        await render(update, *_pels_screen(context), as_new=True)
         return ConversationHandler.END
     await render_screen(update, screens.error_card(error_id), as_new=True)
     return ConversationHandler.END
@@ -931,11 +1002,13 @@ async def start_edit_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
     context.user_data["edit_error_id"] = error_id
+    context.user_data["cancel_back"] = f"err:v:{error_id}"
     await render(
         update,
-        *screens.prompt(
+        *_ask(
+            context,
             f"Новое описание ошибки.\n"
-            f"Сейчас: {escape(item['description'])}"
+            f"Сейчас: {escape(item['description'])}",
         ),
     )
     return ERR_EDIT_DESC
@@ -945,7 +1018,7 @@ async def err_edit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     description = _non_empty(update.message.text if update.message else None)
     error_id = context.user_data.get("edit_error_id")
     if not description or error_id is None:
-        await render(update, *screens.prompt("Введите новое описание:"), as_new=True)
+        await render(update, *_ask(context, "Введите новое описание:"), as_new=True)
         return ERR_EDIT_DESC
     storage.update_error(error_id, description=description)
     context.user_data.clear()
