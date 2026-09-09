@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
@@ -13,6 +14,7 @@ TEXT_FIELDS = {
     "aggregator": "Агрегатор",
     "mic_count": "Количество микрофонов",
     "mic_carrier": "Носитель микрофонов",
+    "os": "Операционная система",
 }
 
 FLAG_GROUPS = [
@@ -142,6 +144,69 @@ DEVICE_FIELDS = {
 DEFAULT_LOCATION = "лаба"
 MAX_PELENGATOR_ID = 999_999_999
 
+CHECK_QUESTIONS = [
+    (
+        "host",
+        "Имя хоста совпадает с номером устройства?",
+        "hostname утилиты nmtui",
+    ),
+    (
+        "net",
+        "Совпадают ли интерфейсы сети?",
+        "FPGA addresses: 192.168.0.212/24\nUSBEth addresses: 192.168.2.xx/24 (xx — номер устройства)",
+    ),
+    ("vpn", "Есть подключение по vpn?", ""),
+    (
+        "alla",
+        "Правильная ли версия (ветка и коммит) у allaproc?",
+        "",
+    ),
+    (
+        "loco",
+        "Правильно настроены параметры postid, device_patch и disabled_mics в loconst?",
+        "",
+    ),
+    ("sjson", "Правильные настройки в settings.json?", ""),
+    ("spy", "Правильные настройки в config/settings.py?", ""),
+    (
+        "agent",
+        "Включен ли агент на устройстве?",
+        "sudo systemctl status device-agent.service",
+    ),
+    (
+        "mics",
+        "Правильно ли работают микрофоны?",
+        "При малом количестве плохих отключите их в loconst и запишите ошибку.",
+    ),
+    (
+        "gla",
+        "Правильно определяются ГЛА с помощью шумелки?",
+        "",
+    ),
+    ("data", "Данные приходят на сервер?", ""),
+    ("tele", "Телеметрия приходит на сервер?", ""),
+    ("cross", "Крест корректно отображается в агенте?", ""),
+]
+CHECK_QUESTION_KEYS = tuple(key for key, _title, _hint in CHECK_QUESTIONS)
+CHECK_RESULTS = ("ok", "minor", "critical")
+CHECK_RESULT_RANK = {"ok": 0, "minor": 1, "critical": 2}
+CHECK_RESULT_LABELS = {
+    "ok": "ок",
+    "minor": "незначительные повреждения",
+    "critical": "критические повреждения",
+    "incomplete": "проверка не завершена",
+    "in_progress": "идёт проверка",
+}
+CHECK_RESULT_EMOJI = {
+    "ok": "🟢",
+    "minor": "🟡",
+    "critical": "🔴",
+    "incomplete": "⚪",
+    "in_progress": "🔵",
+}
+CHECK_ANSWER_FROM_CODE = {"o": "ok", "m": "minor", "c": "critical"}
+CHECK_ANSWER_TO_CODE = {value: key for key, value in CHECK_ANSWER_FROM_CODE.items()}
+
 
 def _connect() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH)
@@ -198,6 +263,23 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 username TEXT NOT NULL DEFAULT '',
                 role TEXT NOT NULL CHECK (role IN ('admin', 'worker'))
+            );
+
+            CREATE TABLE IF NOT EXISTS inspections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pelengator_id INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                FOREIGN KEY (pelengator_id) REFERENCES pelengators(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS inspection_answers (
+                inspection_id INTEGER NOT NULL,
+                question_key TEXT NOT NULL,
+                result TEXT NOT NULL,
+                PRIMARY KEY (inspection_id, question_key),
+                FOREIGN KEY (inspection_id) REFERENCES inspections(id)
             );
             """
         )
@@ -893,6 +975,26 @@ def update_pelengator_type(pelengator_id: int, new_type_id: int) -> str | None:
 def delete_pelengator(pelengator_id: int) -> bool:
     with _lock:
         connection = _connect()
+        try:
+            insp_ids = [
+                int(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM inspections WHERE pelengator_id = ?",
+                    (pelengator_id,),
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            insp_ids = []
+        if insp_ids:
+            placeholders = ", ".join("?" for _ in insp_ids)
+            connection.execute(
+                f"DELETE FROM inspection_answers WHERE inspection_id IN ({placeholders})",
+                insp_ids,
+            )
+            connection.execute(
+                "DELETE FROM inspections WHERE pelengator_id = ?",
+                (pelengator_id,),
+            )
         connection.execute(
             "DELETE FROM errors WHERE pelengator_id = ?",
             (pelengator_id,),
@@ -905,6 +1007,265 @@ def delete_pelengator(pelengator_id: int) -> bool:
         deleted = cursor.rowcount > 0
         connection.close()
     return deleted
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def format_check_time(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    try:
+        return datetime.fromisoformat(iso).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return iso
+
+
+def worst_check_result(results: list[str]) -> str:
+    worst = "ok"
+    worst_rank = -1
+    for result in results:
+        rank = CHECK_RESULT_RANK.get(result, -1)
+        if rank > worst_rank:
+            worst = result
+            worst_rank = rank
+    return worst if worst_rank >= 0 else "incomplete"
+
+
+def _inspection_from_row(row: sqlite3.Row, answers: dict[str, str] | None = None) -> dict:
+    return {
+        "id": int(row["id"]),
+        "pelengator_id": int(row["pelengator_id"]),
+        "started_at": str(row["started_at"] or ""),
+        "finished_at": str(row["finished_at"] or "") if row["finished_at"] else "",
+        "status": str(row["status"] or "in_progress"),
+        "answers": answers if answers is not None else {},
+    }
+
+
+def _load_answers(connection: sqlite3.Connection, inspection_id: int) -> dict[str, str]:
+    rows = connection.execute(
+        """
+        SELECT question_key, result
+        FROM inspection_answers
+        WHERE inspection_id = ?
+        """,
+        (inspection_id,),
+    ).fetchall()
+    return {str(row["question_key"]): str(row["result"]) for row in rows}
+
+
+def _first_unanswered_index(answers: dict[str, str]) -> int | None:
+    for index, key in enumerate(CHECK_QUESTION_KEYS):
+        if key not in answers:
+            return index
+    return None
+
+
+def get_inspection(inspection_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM inspections WHERE id = ?",
+            (inspection_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return None
+        answers = _load_answers(connection, inspection_id)
+        connection.close()
+    item = _inspection_from_row(row, answers)
+    item["next_index"] = _first_unanswered_index(answers)
+    return item
+
+
+def get_latest_inspection(pelengator_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            """
+            SELECT * FROM inspections
+            WHERE pelengator_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (pelengator_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return None
+        answers = _load_answers(connection, int(row["id"]))
+        connection.close()
+    item = _inspection_from_row(row, answers)
+    item["next_index"] = _first_unanswered_index(answers)
+    return item
+
+
+def get_continuable_inspection(pelengator_id: int) -> dict | None:
+    latest = get_latest_inspection(pelengator_id)
+    if latest is None:
+        return None
+    if latest["status"] == "in_progress":
+        return latest
+    if latest["status"] == "incomplete" and latest.get("next_index") is not None:
+        return latest
+    return None
+
+
+def start_inspection(pelengator_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        exists = connection.execute(
+            "SELECT id FROM pelengators WHERE id = ?",
+            (pelengator_id,),
+        ).fetchone()
+        if exists is None:
+            connection.close()
+            return None
+        active = connection.execute(
+            """
+            SELECT id FROM inspections
+            WHERE pelengator_id = ? AND status = 'in_progress'
+            """,
+            (pelengator_id,),
+        ).fetchall()
+        for row in active:
+            connection.execute(
+                "DELETE FROM inspection_answers WHERE inspection_id = ?",
+                (row["id"],),
+            )
+            connection.execute(
+                "DELETE FROM inspections WHERE id = ?",
+                (row["id"],),
+            )
+        cursor = connection.execute(
+            """
+            INSERT INTO inspections (pelengator_id, started_at, finished_at, status)
+            VALUES (?, ?, NULL, 'in_progress')
+            """,
+            (pelengator_id, _now_iso()),
+        )
+        inspection_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+    return get_inspection(int(inspection_id))
+
+
+def resume_inspection(inspection_id: int) -> dict | None:
+    item = get_inspection(inspection_id)
+    if item is None:
+        return None
+    if item["status"] == "incomplete":
+        with _lock:
+            connection = _connect()
+            connection.execute(
+                """
+                UPDATE inspections
+                SET status = 'in_progress', finished_at = NULL
+                WHERE id = ?
+                """,
+                (inspection_id,),
+            )
+            connection.commit()
+            connection.close()
+        return get_inspection(inspection_id)
+    if item["status"] == "in_progress":
+        return item
+    return None
+
+
+def save_check_answer(inspection_id: int, question_index: int, result: str) -> dict | None:
+    if result not in CHECK_RESULTS:
+        return None
+    if question_index < 0 or question_index >= len(CHECK_QUESTION_KEYS):
+        return None
+    key = CHECK_QUESTION_KEYS[question_index]
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM inspections WHERE id = ?",
+            (inspection_id,),
+        ).fetchone()
+        if row is None or str(row["status"]) not in ("in_progress", "incomplete"):
+            connection.close()
+            return None
+        if str(row["status"]) == "incomplete":
+            connection.execute(
+                """
+                UPDATE inspections
+                SET status = 'in_progress', finished_at = NULL
+                WHERE id = ?
+                """,
+                (inspection_id,),
+            )
+        connection.execute(
+            """
+            INSERT INTO inspection_answers (inspection_id, question_key, result)
+            VALUES (?, ?, ?)
+            ON CONFLICT(inspection_id, question_key) DO UPDATE SET result = excluded.result
+            """,
+            (inspection_id, key, result),
+        )
+        connection.commit()
+        connection.close()
+    item = get_inspection(inspection_id)
+    if item and item.get("next_index") is None:
+        return finish_inspection(inspection_id)
+    return item
+
+
+def finish_inspection(inspection_id: int) -> dict | None:
+    item = get_inspection(inspection_id)
+    if item is None:
+        return None
+    answers = [item["answers"][key] for key in CHECK_QUESTION_KEYS if key in item["answers"]]
+    if len(answers) >= len(CHECK_QUESTION_KEYS):
+        status = worst_check_result(answers)
+    else:
+        status = "incomplete"
+    finished = _now_iso()
+    with _lock:
+        connection = _connect()
+        connection.execute(
+            """
+            UPDATE inspections
+            SET status = ?, finished_at = ?
+            WHERE id = ?
+            """,
+            (status, finished, inspection_id),
+        )
+        connection.commit()
+        connection.close()
+    return get_inspection(inspection_id)
+
+
+def cancel_inspection(inspection_id: int) -> int | None:
+    """Удаляет незавершённую проверку. Возвращает pelengator_id."""
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT pelengator_id, status FROM inspections WHERE id = ?",
+            (inspection_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return None
+        pelengator_id = int(row["pelengator_id"])
+        if str(row["status"]) not in ("in_progress", "incomplete"):
+            connection.close()
+            return pelengator_id
+        connection.execute(
+            "DELETE FROM inspection_answers WHERE inspection_id = ?",
+            (inspection_id,),
+        )
+        connection.execute(
+            "DELETE FROM inspections WHERE id = ?",
+            (inspection_id,),
+        )
+        connection.commit()
+        connection.close()
+    return pelengator_id
 
 
 def list_errors_for_pelengator(pelengator_id: int) -> list[dict]:

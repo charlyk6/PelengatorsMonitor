@@ -110,6 +110,25 @@ def _status_lines(item: dict) -> list[str]:
     ]
 
 
+def _break_autolink(text: str) -> str:
+    """Telegram иначе делает из config/settings.py кликабельную ссылку."""
+    return text.replace("config/settings.py", "config/\u200bsettings.py")
+
+
+def check_status_label(status: str) -> str:
+    emoji = storage.CHECK_RESULT_EMOJI.get(status, "⚪")
+    label = storage.CHECK_RESULT_LABELS.get(status, status)
+    return f"{emoji} {label}"
+
+
+def _check_status_lines(pelengator_id: int) -> list[str]:
+    insp = storage.get_latest_inspection(pelengator_id)
+    if insp is None:
+        return ["<b>Последняя проверка:</b> —"]
+    when = storage.format_check_time(insp.get("finished_at") or insp.get("started_at"))
+    return [f"<b>Последняя проверка:</b> {when} · {check_status_label(insp['status'])}"]
+
+
 def pel_id_link(bot_username: str | None, pelengator_id: int) -> str:
     label = f"#{pelengator_id}"
     if not bot_username:
@@ -219,6 +238,7 @@ def type_edit_screen(type_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     )
     rows = [
         [_btn("Название", f"type:f:{type_id}:name")],
+        [_btn("ОС", f"type:f:{type_id}:os")],
         [
             _btn("Микрофоны", f"type:f:{type_id}:mic_distance"),
             _btn("Оси", f"type:f:{type_id}:axis_distance"),
@@ -321,6 +341,7 @@ def pelengator_card(
         f"<b>Пеленгатор #{item['id']}</b>",
         f"Шаблон: <b>{escape(item['type_name'])}</b>",
         *_status_lines(item),
+        *_check_status_lines(pelengator_id),
         "",
         *_hw_text_lines(item["values"], tv),
         "",
@@ -337,7 +358,7 @@ def pelengator_card(
         action_row.append(_btn("🔒 Забронировать", f"pel:bk:{pelengator_id}"))
     elif not taken:
         action_row.append(_btn("🔒 Забронировать", f"pel:bk:{pelengator_id}"))
-    keyboard_rows = [action_row]
+    keyboard_rows = [[_btn("🔎 Проверить", f"chk:go:{pelengator_id}")], action_row]
     if mine:
         keyboard_rows.append([_btn("Освободить", f"pel:ub:{pelengator_id}")])
     keyboard_rows.extend(
@@ -387,6 +408,88 @@ def pel_errors_screen(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup] | 
     return text, _markup(rows)
 
 
+def check_resume_screen(inspection: dict) -> tuple[str, InlineKeyboardMarkup]:
+    pelengator_id = inspection["pelengator_id"]
+    answered = len(inspection.get("answers") or {})
+    total = len(storage.CHECK_QUESTIONS)
+    text = (
+        f"🔎 <b>Проверка пеленгатора #{pelengator_id}</b>\n"
+        f"Статус: {check_status_label(inspection['status'])}\n"
+        f"Отвечено: <b>{answered}/{total}</b>\n"
+        f"Начало: {storage.format_check_time(inspection.get('started_at'))}"
+    )
+    keyboard = _markup(
+        [
+            [_btn("▶ Продолжить", f"chk:cont:{inspection['id']}")],
+            [_btn("↻ Начать заново", f"chk:new:{pelengator_id}")],
+            [_btn("← К пеленгатору", f"pel:v:{pelengator_id}")],
+        ]
+    )
+    return text, keyboard
+
+
+def check_question_screen(inspection: dict, question_index: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    if question_index < 0 or question_index >= len(storage.CHECK_QUESTIONS):
+        return None
+    key, title, hint = storage.CHECK_QUESTIONS[question_index]
+    pelengator_id = inspection["pelengator_id"]
+    total = len(storage.CHECK_QUESTIONS)
+    lines = [
+        f"🔎 <b>Проверка #{pelengator_id}</b> · шаг {question_index + 1}/{total}",
+        "",
+        f"<b>{escape(_break_autolink(title))}</b>",
+    ]
+    if hint:
+        lines.append("")
+        for hint_line in hint.split("\n"):
+            lines.append(f"<code>{escape(hint_line)}</code>")
+    current = (inspection.get("answers") or {}).get(key)
+    if current:
+        lines.append("")
+        lines.append(f"Сейчас: {check_status_label(current)}")
+    insp_id = inspection["id"]
+    keyboard = _markup(
+        [
+            [_btn("🟢 Окей", f"chk:a:{insp_id}:{question_index}:o")],
+            [_btn("🟡 Незначительные повреждения", f"chk:a:{insp_id}:{question_index}:m")],
+            [_btn("🔴 Критические повреждения", f"chk:a:{insp_id}:{question_index}:c")],
+            [
+                _btn("Отменить проверку", f"chk:cx:{insp_id}"),
+                _btn("Закончить", f"chk:end:{insp_id}"),
+            ],
+        ]
+    )
+    return "\n".join(lines), keyboard
+
+
+def check_result_screen(inspection: dict) -> tuple[str, InlineKeyboardMarkup]:
+    pelengator_id = inspection["pelengator_id"]
+    answered = len(inspection.get("answers") or {})
+    total = len(storage.CHECK_QUESTIONS)
+    lines = [
+        f"🔎 <b>Проверка пеленгатора #{pelengator_id}</b>",
+        f"Статус: {check_status_label(inspection['status'])}",
+        f"Отвечено: <b>{answered}/{total}</b>",
+        f"Время: {storage.format_check_time(inspection.get('finished_at') or inspection.get('started_at'))}",
+        "",
+    ]
+    answers = inspection.get("answers") or {}
+    for key, title, _hint in storage.CHECK_QUESTIONS:
+        result = answers.get(key)
+        if result:
+            mark = storage.CHECK_RESULT_EMOJI.get(result, "⚪")
+            lines.append(f"{mark} {escape(_break_autolink(title))}")
+        else:
+            lines.append(f"⚪ {escape(_break_autolink(title))}")
+    keyboard = _markup(
+        [
+            [_btn("↻ Начать заново", f"chk:new:{pelengator_id}")],
+            [_btn("← К пеленгатору", f"pel:v:{pelengator_id}")],
+        ]
+    )
+    return "\n".join(lines), keyboard
+
+
 def pel_props_screen(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     item = storage.get_pelengator(pelengator_id)
     if item is None:
@@ -416,8 +519,11 @@ def pel_props_screen(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup] | N
         return _btn(f"{label}{mark}", f"pel:tx:{pelengator_id}:{field}")
 
     rows = [
-        [_text_btn(left, left_label), _text_btn(right, right_label)]
-        for left, left_label, right, right_label in text_pairs
+        [_text_btn("os", "ОС")],
+        *[
+            [_text_btn(left, left_label), _text_btn(right, right_label)]
+            for left, left_label, right, right_label in text_pairs
+        ],
     ]
     for title, flags in storage.FLAG_GROUPS:
         rows.append([_btn(f"── {title} ──", f"pel:pr:{pelengator_id}")])
@@ -556,7 +662,7 @@ def error_card(error_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
         f"Пеленгатор: <code>{item['pelengator_id']}</code>\n"
         f"Тип: <b>{category}</b>\n"
         f"Приоритет: <b>{error_priority_text(item)}</b>\n\n"
-        f"<b>Описание:</b>\n{escape(item['description'])}"
+        f"<b>Описание:</b>\n<b>{escape(item['description'])}</b>"
     )
     prio_row = []
     for key in storage.ERROR_PRIORITIES:

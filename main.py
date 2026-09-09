@@ -332,6 +332,81 @@ async def _notify_user(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, tex
         return
 
 
+async def _show_check_step(update: Update, inspection: dict | None, pelengator_id: int | None = None) -> int:
+    if inspection is None:
+        if pelengator_id is not None:
+            await render_screen(update, _pel_card(update, pelengator_id))
+        else:
+            await render(update, *_home(update))
+        return ConversationHandler.END
+    next_index = inspection.get("next_index")
+    if inspection["status"] == "in_progress" and next_index is not None:
+        await render_screen(
+            update, screens.check_question_screen(inspection, next_index)
+        )
+        return ConversationHandler.END
+    await render(update, *screens.check_result_screen(inspection))
+    return ConversationHandler.END
+
+
+async def on_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = query.data
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "go":
+        pelengator_id = int(parts[2])
+        current = storage.get_continuable_inspection(pelengator_id)
+        if current:
+            await render(update, *screens.check_resume_screen(current))
+            return ConversationHandler.END
+        inspection = storage.start_inspection(pelengator_id)
+        return await _show_check_step(update, inspection, pelengator_id)
+
+    if action == "new":
+        pelengator_id = int(parts[2])
+        inspection = storage.start_inspection(pelengator_id)
+        return await _show_check_step(update, inspection, pelengator_id)
+
+    if action == "cont":
+        inspection_id = int(parts[2])
+        inspection = storage.resume_inspection(inspection_id)
+        pelengator_id = None if inspection is None else inspection["pelengator_id"]
+        return await _show_check_step(update, inspection, pelengator_id)
+
+    if action == "a":
+        inspection_id = int(parts[2])
+        question_index = int(parts[3])
+        result = storage.CHECK_ANSWER_FROM_CODE.get(parts[4] if len(parts) > 4 else "")
+        if result is None:
+            await query.answer("Неизвестный ответ")
+            return ConversationHandler.END
+        inspection = storage.save_check_answer(inspection_id, question_index, result)
+        pelengator_id = None if inspection is None else inspection["pelengator_id"]
+        if inspection and inspection.get("next_index") is None:
+            await query.answer("Проверка завершена")
+        return await _show_check_step(update, inspection, pelengator_id)
+
+    if action == "cx":
+        pelengator_id = storage.cancel_inspection(int(parts[2]))
+        await query.answer("Проверка отменена, результаты не сохранены")
+        if pelengator_id is None:
+            await render(update, *_pels_screen(context))
+        else:
+            await render_screen(update, _pel_card(update, pelengator_id))
+        return ConversationHandler.END
+
+    if action == "end":
+        inspection = storage.finish_inspection(int(parts[2]))
+        pelengator_id = None if inspection is None else inspection["pelengator_id"]
+        await query.answer("Проверка сохранена")
+        return await _show_check_step(update, inspection, pelengator_id)
+
+    await query.answer()
+    return ConversationHandler.END
+
+
 @need_user
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
     query = update.callback_query
@@ -465,6 +540,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if data.startswith("pel:v:"):
         await render_screen(update, _pel_card(update, int(data.split(":")[2])))
         return ConversationHandler.END
+    if data.startswith("chk:"):
+        return await on_check_callback(update, context)
     if data.startswith("pel:er:"):
         await render_screen(update, screens.pel_errors_screen(int(data.split(":")[2])))
         return ConversationHandler.END
