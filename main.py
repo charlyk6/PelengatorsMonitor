@@ -2,7 +2,7 @@ from html import escape
 import os
 import time
 
-from telegram import LinkPreviewOptions, Update
+from telegram import InputMediaPhoto, LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.ext import (
@@ -31,7 +31,19 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
     ERR_DESC,
     ERR_EDIT_DESC,
     USER_EDIT_NAME,
-) = range(9)
+    STK_NAME,
+    STK_QTY,
+    STK_LOC,
+    STK_PHOTO,
+) = range(13)
+
+STOCK_ERROR_TEXT = {
+    "not_enough": "Недостаточно на этом месте.",
+    "same_location": "Это то же самое место.",
+    "not_found": "Товар не найден.",
+    "bad_location": "Укажите место.",
+    "bad_qty": "Некорректное количество.",
+}
 
 TYPE_FIELD_PROMPTS = {
     "name": "Введите новое название:",
@@ -92,6 +104,76 @@ async def render_screen(
     await render(update, *screen, as_new=as_new)
 
 
+async def render_stock_card(
+    update: Update,
+    item_id: int,
+    *,
+    as_new: bool = False,
+) -> None:
+    screen = screens.stock_item_card(item_id)
+    if screen is None:
+        await render_screen(update, None, as_new=as_new)
+        return
+    text, markup = screen
+    item = storage.get_stock_item(item_id)
+    photo = (item or {}).get("photo_file_id") or ""
+    query = update.callback_query
+    chat = update.effective_chat
+
+    async def send_new() -> None:
+        if chat is None:
+            return
+        if photo:
+            await chat.send_photo(
+                photo=photo,
+                caption=text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await chat.send_message(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=_NO_PREVIEW,
+        )
+
+    if query and not as_new:
+        try:
+            await query.answer()
+        except BadRequest:
+            pass
+        try:
+            if photo:
+                await query.edit_message_media(
+                    media=InputMediaPhoto(
+                        media=photo,
+                        caption=text,
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    reply_markup=markup,
+                )
+            else:
+                await query.edit_message_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                    link_preview_options=_NO_PREVIEW,
+                )
+            return
+        except BadRequest:
+            pass
+        if query.message is not None:
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
+        await send_new()
+        return
+
+    await send_new()
+
+
 async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await render(update, *_home(update))
@@ -115,19 +197,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if status == "blocked":
         await render(update, *screens.blocked_screen(), as_new=True)
         return ConversationHandler.END
-    pelengator_id = _parse_start_pelengator_id(context)
-    if pelengator_id is not None:
-        screen = _pel_card(update, pelengator_id)
+    kind, entity_id = _parse_start_arg(context)
+    if kind == "pel" and entity_id is not None:
+        screen = _pel_card(update, entity_id)
         if screen is None:
             await render(
                 update,
-                f"Пеленгатор <code>#{pelengator_id}</code> не найден.\n\n"
+                f"Пеленгатор <code>#{entity_id}</code> не найден.\n\n"
                 + _home(update)[0],
                 _home(update)[1],
                 as_new=True,
             )
         else:
             await render_screen(update, screen, as_new=True)
+        return ConversationHandler.END
+    if kind == "stock" and entity_id is not None:
+        if storage.get_stock_item(entity_id) is None:
+            await render(
+                update,
+                "Товар не найден.\n\n" + _home(update)[0],
+                _home(update)[1],
+                as_new=True,
+            )
+        else:
+            await render_stock_card(update, entity_id, as_new=True)
         return ConversationHandler.END
     await render(update, *_home(update), as_new=True)
     return ConversationHandler.END
@@ -204,6 +297,29 @@ def _pels_screen(context: ContextTypes.DEFAULT_TYPE):
     return screens.pelengators_screen(_bot_username(context))
 
 
+def _arch_screen(context: ContextTypes.DEFAULT_TYPE):
+    return screens.pelengators_screen(_bot_username(context), archived=True)
+
+
+def _stock_hub(context: ContextTypes.DEFAULT_TYPE):
+    return screens.stock_hub_screen(_bot_username(context))
+
+
+def _add_pel_pick(*, from_arch: bool) -> tuple:
+    return screens.pelengator_pick_type_screen(
+        "pel:aa:" if from_arch else "pel:at:",
+        "nav:arch" if from_arch else "nav:pels",
+        "Какой шаблон у нового пеленгатора?",
+    )
+
+
+def _stk_back(context: ContextTypes.DEFAULT_TYPE) -> str:
+    item_id = context.user_data.get("stk_item_id")
+    if item_id:
+        return f"stk:v:{item_id}"
+    return "nav:stock"
+
+
 def _ask(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
@@ -217,14 +333,26 @@ def _ask(
     )
 
 
-def _parse_start_pelengator_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+def _parse_start_arg(context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, int | None]:
     args = context.args or []
     if not args:
-        return None
+        return None, None
     raw = (args[0] or "").strip()
-    if len(raw) < 2 or raw[0] not in ("p", "P"):
-        return None
-    return storage.parse_pelengator_id(raw[1:])
+    if len(raw) < 2:
+        return None, None
+    prefix = raw[0].lower()
+    rest = raw[1:]
+    if prefix == "p":
+        return "pel", storage.parse_pelengator_id(rest)
+    if prefix == "s":
+        try:
+            item_id = int(rest)
+        except ValueError:
+            return None, None
+        if item_id <= 0:
+            return None, None
+        return "stock", item_id
+    return None, None
 
 
 def _profile(update: Update) -> tuple[str, object] | None:
@@ -427,6 +555,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if data == "nav:pels":
         await render(update, *_pels_screen(context))
         return ConversationHandler.END
+    if data == "nav:arch":
+        await render(update, *_arch_screen(context))
+        return ConversationHandler.END
+    if data == "nav:stock":
+        context.user_data.clear()
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
     if data == "nav:errs":
         await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
@@ -497,7 +632,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await render(update, *screens.errors_all_screen())
         return ConversationHandler.END
 
-    if data == "type:add":
+    if data == "type:add" or data == "type:add:a":
         return await start_add_type(update, context)
     if data.startswith("type:v:"):
         await render_screen(update, screens.type_card(int(data.split(":")[2])))
@@ -524,18 +659,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         await render(update, *screens.types_screen())
         return ConversationHandler.END
-
-    if data == "pel:add":
-        await render(
-            update,
-            *screens.pelengator_pick_type_screen(
-                "pel:at:",
-                "nav:pels",
-                "Какой шаблон у нового пеленгатора?",
-            ),
+    if data.startswith("type:ar:"):
+        type_id = int(data.split(":")[2])
+        item = storage.get_type(type_id)
+        if item is None:
+            await render(update, *screens.types_screen())
+            return ConversationHandler.END
+        now_archive = not bool(item.get("is_archive"))
+        storage.set_type_archive(type_id, now_archive)
+        await query.answer(
+            "Шаблон архивный" if now_archive else "Шаблон обычный"
         )
+        await render_screen(update, screens.type_card(type_id))
         return ConversationHandler.END
-    if data.startswith("pel:at:"):
+
+    if data == "pel:add" or data == "pel:adda":
+        await render(update, *_add_pel_pick(from_arch=data == "pel:adda"))
+        return ConversationHandler.END
+    if data.startswith("pel:at:") or data.startswith("pel:aa:"):
         return await start_add_pelengator(update, context)
     if data.startswith("pel:v:"):
         await render_screen(update, _pel_card(update, int(data.split(":")[2])))
@@ -635,6 +776,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.answer("Шаблон обновлён")
         await render_screen(update, _pel_card(update, int(pelengator_id)))
         return ConversationHandler.END
+    if data.startswith("pel:ar:"):
+        pelengator_id = int(data.split(":")[2])
+        item = storage.get_pelengator(pelengator_id)
+        if item is None:
+            await render(update, *_pels_screen(context))
+            return ConversationHandler.END
+        now_archived = not bool(item.get("is_archived"))
+        storage.set_pelengator_archived(pelengator_id, now_archived)
+        await query.answer("В архиве" if now_archived else "Достали из архива")
+        await render_screen(update, _pel_card(update, pelengator_id))
+        return ConversationHandler.END
     if data.startswith("pel:d:"):
         await render_screen(
             update,
@@ -643,9 +795,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     if data.startswith("pel:do:"):
         pelengator_id = int(data.split(":")[2])
+        item = storage.get_pelengator(pelengator_id)
+        was_archived = bool(item and item.get("is_archived"))
         storage.delete_pelengator(pelengator_id)
         await query.answer("Пеленгатор удалён")
-        await render(update, *_pels_screen(context))
+        await render(
+            update,
+            *(_arch_screen(context) if was_archived else _pels_screen(context)),
+        )
         return ConversationHandler.END
 
     if data.startswith("err:add:"):
@@ -717,28 +874,586 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             await render(update, *screens.errors_hub_screen())
         return ConversationHandler.END
 
+    if data.startswith("stk:"):
+        return await on_stock_callback(update, context)
+
+    await query.answer()
+    return None
+
+
+async def _ask_stock_qty(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    as_new: bool = False,
+) -> int:
+    item_id = context.user_data.get("stk_item_id")
+    item = None if item_id is None else storage.get_stock_item(item_id)
+    if item is None:
+        await render(update, *_stock_hub(context), as_new=as_new)
+        return ConversationHandler.END
+    op = context.user_data.get("stk_op")
+    name = escape(item["name"])
+    if op == "add":
+        text = f"Сколько добавить «{name}» в лабу?"
+    elif op == "return":
+        loc = context.user_data.get("stk_from") or "—"
+        avail = storage.lot_qty(item, loc)
+        text = (
+            f"Сколько «{name}» вернуть в лабу из «{escape(str(loc))}»?\n"
+            f"На месте: <b>{avail}</b> шт."
+        )
+    elif op == "move":
+        loc = context.user_data.get("stk_from") or "—"
+        dest = context.user_data.get("stk_to") or "—"
+        avail = storage.lot_qty(item, loc)
+        text = (
+            f"Сколько «{name}» переместить из «{escape(str(loc))}» "
+            f"в «{escape(str(dest))}»?\n"
+            f"На месте: <b>{avail}</b> шт."
+        )
+    else:
+        loc = context.user_data.get("stk_from") or "—"
+        avail = storage.lot_qty(item, loc)
+        text = (
+            f"Сколько «{name}» списать из «{escape(str(loc))}»?\n"
+            f"На месте: <b>{avail}</b> шт."
+        )
+    context.user_data["cancel_back"] = _stk_back(context)
+    await render(update, *_ask(context, text), as_new=as_new)
+    return STK_QTY
+
+
+async def _ask_move_dest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    as_new: bool = False,
+) -> int:
+    item_id = context.user_data.get("stk_item_id")
+    item = None if item_id is None else storage.get_stock_item(item_id)
+    from_loc = context.user_data.get("stk_from") or ""
+    if item is None or not from_loc:
+        await render(update, *_stock_hub(context), as_new=as_new)
+        return ConversationHandler.END
+    context.user_data["stk_pick"] = "to"
+    context.user_data["cancel_back"] = _stk_back(context)
+    await render(
+        update,
+        *_ask(
+            context,
+            f"Куда переместить «{escape(item['name'])}» "
+            f"из «{escape(from_loc)}»?\n"
+            "Напишите место.",
+        ),
+        as_new=as_new,
+    )
+    return STK_LOC
+
+
+async def _apply_stock_location(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    location: str,
+    *,
+    as_new: bool = False,
+) -> int:
+    item_id = context.user_data.get("stk_item_id")
+    op = context.user_data.get("stk_op")
+    location = storage.normalize_stock_text(location)
+    from_loc = storage.normalize_stock_text(context.user_data.get("stk_from") or "")
+    if item_id is None or not location or op != "move":
+        await render(update, *_stock_hub(context), as_new=as_new)
+        return ConversationHandler.END
+    if location.lower() == from_loc.lower():
+        await render(
+            update,
+            *_ask(
+                context,
+                STOCK_ERROR_TEXT.get("same_location", "Это то же самое место.")
+                + "\nВведите другое место:",
+            ),
+            as_new=True,
+        )
+        return STK_LOC
+    context.user_data["stk_to"] = location
+    return await _ask_stock_qty(update, context, as_new=as_new)
+
+
+@need_user
+async def on_stock_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return None
+    data = query.data
+    if data.startswith("stk:v:"):
+        context.user_data.clear()
+        await render_stock_card(update, int(data.split(":")[2]))
+        return ConversationHandler.END
+    if data == "stk:in" or data.startswith("stk:in:"):
+        return await start_stock_income(update, context)
+    if data.startswith("stk:mv:"):
+        return await start_stock_move(update, context)
+    if data.startswith("stk:rt:"):
+        return await start_stock_return(update, context)
+    if data.startswith("stk:rm:"):
+        return await start_stock_remove(update, context)
+    if data == "stk:ok":
+        return await start_stock_create(update, context)
+    if data.startswith("stk:use:"):
+        return await start_stock_use(update, context)
+    if data.startswith("stk:ph:"):
+        return await start_stock_photo(update, context)
+    if data.startswith("stk:px:"):
+        item_id = int(data.split(":")[2])
+        storage.set_stock_photo(item_id, None)
+        await query.answer("Фото убрано")
+        await render_stock_card(update, item_id)
+        return ConversationHandler.END
+    if data.startswith("stk:do:"):
+        item_id = int(data.split(":")[2])
+        storage.delete_stock_item(item_id)
+        await query.answer("Карточка удалена")
+        context.user_data.clear()
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
+    if data.startswith("stk:d:"):
+        await render_screen(
+            update,
+            screens.confirm_delete_stock_item(int(data.split(":")[2])),
+        )
+        return ConversationHandler.END
+    if data.startswith("stk:fl:") or data.startswith("stk:rl:") or data.startswith("stk:rf:"):
+        return await stock_pick_from(update, context)
     await query.answer()
     return None
 
 
 @need_user
-async def start_add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_stock_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    parts = (update.callback_query.data or "").split(":")
+    item_id = int(parts[2]) if len(parts) > 2 else None
     context.user_data.clear()
+    context.user_data["stk_op"] = "add"
+    if item_id is not None:
+        item = storage.get_stock_item(item_id)
+        if item is None:
+            await render(update, *_stock_hub(context))
+            return ConversationHandler.END
+        context.user_data["stk_item_id"] = item_id
+        context.user_data["cancel_back"] = f"stk:v:{item_id}"
+        return await _ask_stock_qty(update, context)
+    context.user_data["cancel_back"] = "nav:stock"
+    await render(update, *_ask(context, "Введите название товара:"))
+    return STK_NAME
+
+
+async def stock_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = storage.normalize_stock_text(update.message.text if update.message else None)
+    if not name:
+        await render(
+            update,
+            *_ask(context, "Название пустое. Введите название товара:"),
+            as_new=True,
+        )
+        return STK_NAME
+    if len(name) > storage.MAX_STOCK_NAME:
+        await render(
+            update,
+            *_ask(
+                context,
+                f"Слишком длинное название (макс. {storage.MAX_STOCK_NAME}). "
+                "Введите название товара:",
+            ),
+            as_new=True,
+        )
+        return STK_NAME
+    context.user_data["stk_name"] = name
+    exact = storage.find_stock_item_by_name(name)
+    if exact is not None:
+        context.user_data["stk_item_id"] = exact["id"]
+        return await _ask_stock_qty(update, context, as_new=True)
+    best = storage.best_stock_match(name)
+    await render(
+        update,
+        *screens.stock_add_choice_screen(name, best),
+        as_new=True,
+    )
+    return STK_NAME
+
+
+@need_user
+async def start_stock_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = context.user_data.get("stk_name")
+    if not name:
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
+    item_id = storage.add_stock_item(name)
+    if item_id is None:
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
+    context.user_data["stk_op"] = "add"
+    context.user_data["stk_item_id"] = item_id
+    context.user_data["cancel_back"] = f"stk:v:{item_id}"
+    return await _ask_stock_qty(update, context)
+
+
+@need_user
+async def start_stock_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = int(update.callback_query.data.split(":")[2])
+    item = storage.get_stock_item(item_id)
+    if item is None:
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
+    context.user_data["stk_op"] = "add"
+    context.user_data["stk_item_id"] = item_id
+    context.user_data["cancel_back"] = f"stk:v:{item_id}"
+    return await _ask_stock_qty(update, context)
+
+
+@need_user
+async def start_stock_move(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = int(update.callback_query.data.split(":")[2])
+    return await _start_stock_from_lots(update, context, item_id, op="move")
+
+
+@need_user
+async def start_stock_return(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = int(update.callback_query.data.split(":")[2])
+    return await _start_stock_from_lots(update, context, item_id, op="return")
+
+
+@need_user
+async def start_stock_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = int(update.callback_query.data.split(":")[2])
+    return await _start_stock_from_lots(update, context, item_id, op="remove")
+
+
+def _stock_from_lots(item: dict, op: str) -> list[dict]:
+    lots = list(item.get("lots") or [])
+    if op != "return":
+        return lots
+    lab = storage.DEFAULT_LOCATION.lower()
+    return [
+        lot
+        for lot in lots
+        if str(lot.get("location") or "").lower() != lab
+    ]
+
+
+async def _start_stock_from_lots(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    item_id: int,
+    *,
+    op: str,
+) -> int:
+    item = storage.get_stock_item(item_id)
+    if item is None:
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
+    lots = _stock_from_lots(item, op)
+    if op == "return":
+        empty_text = (
+            "Всё уже в лабе"
+            if item.get("lots")
+            else "Нечего возвращать"
+        )
+    elif op == "move":
+        empty_text = "Нечего перемещать"
+    else:
+        empty_text = "Нечего списывать"
+    if not lots:
+        try:
+            await update.callback_query.answer(empty_text, show_alert=True)
+        except BadRequest:
+            pass
+        await render_stock_card(update, item_id)
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["stk_op"] = op
+    context.user_data["stk_item_id"] = item_id
+    context.user_data["stk_from_choices"] = [lot["location"] for lot in lots]
+    context.user_data["cancel_back"] = f"stk:v:{item_id}"
+    if len(lots) == 1:
+        context.user_data["stk_from"] = lots[0]["location"]
+        if op == "move":
+            return await _ask_move_dest(update, context)
+        return await _ask_stock_qty(update, context)
+    context.user_data["stk_pick"] = "from"
+    if op == "return":
+        title = f"Откуда вернуть «{escape(item['name'])}» в лабу?"
+        prefix = "stk:rf:"
+    elif op == "move":
+        title = f"Откуда переместить «{escape(item['name'])}»?"
+        prefix = "stk:fl:"
+    else:
+        title = f"Откуда списать «{escape(item['name'])}»?"
+        prefix = "stk:rl:"
+    await render(
+        update,
+        *screens.stock_lot_pick_screen(
+            item,
+            callback_prefix=prefix,
+            title=title,
+            back=f"stk:v:{item_id}",
+            lots=lots,
+        ),
+    )
+    return STK_LOC
+
+
+@need_user
+async def stock_pick_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = context.user_data.get("stk_item_id")
+    item = None if item_id is None else storage.get_stock_item(item_id)
+    if item is None:
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
+    try:
+        index = int(update.callback_query.data.split(":")[2])
+        choices = context.user_data.get("stk_from_choices")
+        if choices:
+            location = choices[index]
+        else:
+            location = item["lots"][index]["location"]
+    except (IndexError, ValueError, KeyError, TypeError):
+        await render_stock_card(update, item_id)
+        return ConversationHandler.END
+    context.user_data["stk_from"] = location
+    if context.user_data.get("stk_op") == "move":
+        return await _ask_move_dest(update, context)
+    return await _ask_stock_qty(update, context)
+
+
+async def stock_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    qty = storage.parse_stock_qty(update.message.text if update.message else None)
+    item_id = context.user_data.get("stk_item_id")
+    item = None if item_id is None else storage.get_stock_item(item_id)
+    op = context.user_data.get("stk_op")
+    if item is None or op not in ("add", "move", "remove", "return"):
+        await render(update, *_stock_hub(context), as_new=True)
+        return ConversationHandler.END
+    if qty is None:
+        await render(
+            update,
+            *_ask(
+                context,
+                f"Нужно целое число от 1 до {storage.MAX_STOCK_QTY}. "
+                "Введите количество:",
+            ),
+            as_new=True,
+        )
+        return STK_QTY
+    if op in ("move", "remove", "return"):
+        avail = storage.lot_qty(item, context.user_data.get("stk_from") or "")
+        if qty > avail:
+            await render(
+                update,
+                *_ask(
+                    context,
+                    f"На этом месте только <b>{avail}</b> шт. Введите количество:",
+                ),
+                as_new=True,
+            )
+            return STK_QTY
+    context.user_data["stk_qty"] = qty
+    if op == "add":
+        error = storage.add_stock(item_id, storage.DEFAULT_LOCATION, qty)
+        if error:
+            await render(
+                update,
+                *_ask(
+                    context,
+                    STOCK_ERROR_TEXT.get(error, "Не получилось.")
+                    + "\nВведите количество:",
+                ),
+                as_new=True,
+            )
+            return STK_QTY
+        context.user_data.clear()
+        await render_stock_card(update, item_id, as_new=True)
+        return ConversationHandler.END
+    if op == "remove":
+        error = storage.remove_stock(
+            item_id,
+            context.user_data.get("stk_from") or "",
+            qty,
+        )
+        if error:
+            await render(
+                update,
+                *_ask(
+                    context,
+                    STOCK_ERROR_TEXT.get(error, "Не получилось.")
+                    + "\nВведите количество:",
+                ),
+                as_new=True,
+            )
+            return STK_QTY
+        context.user_data.clear()
+        await render_stock_card(update, item_id, as_new=True)
+        return ConversationHandler.END
+    if op == "return":
+        error = storage.move_stock(
+            item_id,
+            context.user_data.get("stk_from") or "",
+            storage.DEFAULT_LOCATION,
+            qty,
+        )
+        if error:
+            await render(
+                update,
+                *_ask(
+                    context,
+                    STOCK_ERROR_TEXT.get(error, "Не получилось.")
+                    + "\nВведите количество:",
+                ),
+                as_new=True,
+            )
+            return STK_QTY
+        context.user_data.clear()
+        await render_stock_card(update, item_id, as_new=True)
+        return ConversationHandler.END
+    dest = context.user_data.get("stk_to") or ""
+    if not dest:
+        return await _ask_move_dest(update, context, as_new=True)
+    error = storage.move_stock(
+        item_id,
+        context.user_data.get("stk_from") or "",
+        dest,
+        qty,
+    )
+    if error:
+        await render(
+            update,
+            *_ask(
+                context,
+                STOCK_ERROR_TEXT.get(error, "Не получилось.")
+                + "\nВведите количество:",
+            ),
+            as_new=True,
+        )
+        return STK_QTY
+    context.user_data.clear()
+    await render_stock_card(update, item_id, as_new=True)
+    return ConversationHandler.END
+
+
+async def stock_loc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("stk_pick") == "from":
+        await render(
+            update,
+            *_ask(context, "Выберите место кнопкой, не сообщением."),
+            as_new=True,
+        )
+        return STK_LOC
+    location = storage.normalize_stock_text(
+        update.message.text if update.message else None
+    )
+    if not location:
+        await render(
+            update,
+            *_ask(context, "Место пустое. Введите место:"),
+            as_new=True,
+        )
+        return STK_LOC
+    return await _apply_stock_location(update, context, location, as_new=True)
+
+
+def _message_photo_id(message) -> str | None:
+    if message is None:
+        return None
+    if message.photo:
+        return message.photo[-1].file_id
+    document = message.document
+    if document is not None and (document.mime_type or "").startswith("image/"):
+        return document.file_id
+    return None
+
+
+@need_user
+async def start_stock_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = int(update.callback_query.data.split(":")[2])
+    item = storage.get_stock_item(item_id)
+    if item is None:
+        await render(update, *_stock_hub(context))
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["stk_item_id"] = item_id
+    context.user_data["cancel_back"] = f"stk:v:{item_id}"
+    await render(update, *screens.stock_photo_prompt(item_id, item["name"]))
+    return STK_PHOTO
+
+
+async def stock_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = context.user_data.get("stk_item_id")
+    file_id = _message_photo_id(update.message)
+    if item_id is None:
+        await render(update, *_stock_hub(context), as_new=True)
+        return ConversationHandler.END
+    item = storage.get_stock_item(item_id)
+    if item is None or not file_id:
+        await render(
+            update,
+            *screens.stock_photo_prompt(
+                item_id,
+                (item or {}).get("name") or "товар",
+            ),
+            as_new=True,
+        )
+        return STK_PHOTO
+    storage.set_stock_photo(item_id, file_id)
+    context.user_data.clear()
+    await render_stock_card(update, item_id, as_new=True)
+    return ConversationHandler.END
+
+
+async def stock_photo_wrong(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    item_id = context.user_data.get("stk_item_id")
+    item = None if item_id is None else storage.get_stock_item(item_id)
+    if item is None:
+        await render(update, *_stock_hub(context), as_new=True)
+        return ConversationHandler.END
+    await render(
+        update,
+        *screens.stock_photo_prompt(item_id, item["name"]),
+        as_new=True,
+    )
+    return STK_PHOTO
+
+
+@need_user
+async def start_add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    is_archive = (update.callback_query.data or "") == "type:add:a"
+    context.user_data.clear()
+    context.user_data["new_type_archive"] = is_archive
     context.user_data["cancel_back"] = "nav:types"
-    await render(update, *_ask(context, "Введите название шаблона:"))
+    prompt = (
+        "Введите название архивного шаблона:"
+        if is_archive
+        else "Введите название шаблона:"
+    )
+    await render(update, *_ask(context, prompt))
     return TYPE_NAME
 
 
 async def type_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = _non_empty(update.message.text if update.message else None)
+    is_archive = bool(context.user_data.get("new_type_archive"))
+    empty_prompt = (
+        "Название пустое. Введите название архивного шаблона:"
+        if is_archive
+        else "Название пустое. Введите название шаблона:"
+    )
     if not name:
         await render(
             update,
-            *_ask(context, "Название пустое. Введите название шаблона:"),
+            *_ask(context, empty_prompt),
             as_new=True,
         )
         return TYPE_NAME
-    type_id = storage.add_type(name)
+    type_id = storage.add_type(name, is_archive=is_archive)
     context.user_data.clear()
     await render_screen(update, screens.type_card(type_id), as_new=True)
     return ConversationHandler.END
@@ -882,14 +1597,16 @@ async def pel_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 @need_user
 async def start_add_pelengator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    type_id = int(update.callback_query.data.split(":")[2])
+    parts = update.callback_query.data.split(":")
+    from_arch = parts[1] == "aa"
+    type_id = int(parts[2])
     type_item = storage.get_type(type_id)
     if type_item is None:
         await render(update, *screens.types_screen())
         return ConversationHandler.END
     context.user_data.clear()
     context.user_data["pelengator_type_id"] = type_id
-    context.user_data["cancel_back"] = "pel:add"
+    context.user_data["cancel_back"] = "pel:adda" if from_arch else "pel:add"
     await render(
         update,
         *_ask(
@@ -1107,25 +1824,35 @@ _last_network_log = 0.0
 
 
 @need_user
-async def open_pelengator_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Открывает карточку пеленгатора если пользователь отправил число."""
-    text = (update.message.text or "").strip()
-    if not text.isdigit():
+async def open_by_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = storage.normalize_stock_text(update.message.text if update.message else None)
+    if not text:
         return
-    pelengator_id = storage.parse_pelengator_id(text)
-    if pelengator_id is None:
+    if text.isdigit():
+        pelengator_id = storage.parse_pelengator_id(text)
+        if pelengator_id is None:
+            await update.message.reply_text(
+                f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}.",
+            )
+            return
+        item = storage.get_pelengator(pelengator_id)
+        if item is None:
+            await update.message.reply_text(
+                f"Пеленгатор <code>#{pelengator_id}</code> не найден.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await render_screen(update, _pel_card(update, pelengator_id), as_new=True)
+        return
+    if not any(ch.isalpha() for ch in text):
+        return
+    match = storage.find_stock_item_by_name(text) or storage.best_stock_match(text)
+    if match is None:
         await update.message.reply_text(
-            f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}.",
+            f"Товар «{text}» не найден.",
         )
         return
-    item = storage.get_pelengator(pelengator_id)
-    if item is None:
-        await update.message.reply_text(
-            f"Пеленгатор <code>#{pelengator_id}</code> не найден.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    await render_screen(update, _pel_card(update, pelengator_id), as_new=True)
+    await render_stock_card(update, match["id"], as_new=True)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1159,9 +1886,9 @@ def main() -> None:
     conversation = ConversationHandler(
         entry_points=[
             CommandHandler("start", cmd_start),
-            CallbackQueryHandler(start_add_type, pattern=r"^type:add$"),
+            CallbackQueryHandler(start_add_type, pattern=r"^type:add(?:\:a)?$"),
             CallbackQueryHandler(start_edit_type_field, pattern=r"^type:f:"),
-            CallbackQueryHandler(start_add_pelengator, pattern=r"^pel:at:"),
+            CallbackQueryHandler(start_add_pelengator, pattern=r"^pel:a[ta]:"),
             CallbackQueryHandler(start_edit_pel_field, pattern=r"^pel:tx:"),
             CallbackQueryHandler(start_move_pelengator, pattern=r"^pel:mv:"),
             CallbackQueryHandler(start_pick_error_pelengator, pattern=r"^err:add:"),
@@ -1169,6 +1896,7 @@ def main() -> None:
             CallbackQueryHandler(start_error_description, pattern=r"^err:np:"),
             CallbackQueryHandler(start_edit_error, pattern=r"^err:e:"),
             CallbackQueryHandler(start_edit_own_name, pattern=r"^me:name$"),
+            CallbackQueryHandler(on_stock_callback, pattern=r"^stk:"),
         ],
         states={
             USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_reg_name)],
@@ -1188,6 +1916,13 @@ def main() -> None:
             ERR_EDIT_DESC: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, err_edit_desc)
             ],
+            STK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, stock_name)],
+            STK_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, stock_qty)],
+            STK_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, stock_loc)],
+            STK_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, stock_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, stock_photo_wrong),
+            ],
         },
         fallbacks=[
             CommandHandler("start", cmd_start),
@@ -1201,7 +1936,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(CommandHandler("start", cmd_start))
     # Ввод числа вне диалога → открыть карточку пеленгатора
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_pelengator_by_id))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_by_message))
     app.add_error_handler(on_error)
 
     print("Бот запущен!")

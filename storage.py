@@ -281,6 +281,19 @@ def init_db() -> None:
                 PRIMARY KEY (inspection_id, question_key),
                 FOREIGN KEY (inspection_id) REFERENCES inspections(id)
             );
+
+            CREATE TABLE IF NOT EXISTS stock_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS stock_lots (
+                item_id INTEGER NOT NULL,
+                location TEXT NOT NULL,
+                qty INTEGER NOT NULL CHECK (qty > 0),
+                PRIMARY KEY (item_id, location),
+                FOREIGN KEY (item_id) REFERENCES stock_items(id)
+            );
             """
         )
         error_columns = _columns(connection, "errors")
@@ -339,6 +352,24 @@ def init_db() -> None:
             "reserved_user_id",
             "INTEGER",
         )
+        _ensure_column(
+            connection,
+            "pelengator_types",
+            "is_archive",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            connection,
+            "pelengators",
+            "is_archived",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            connection,
+            "stock_items",
+            "photo_file_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )
         connection.execute(
             """
             UPDATE pelengators
@@ -364,8 +395,12 @@ def init_db() -> None:
 
 
 def _type_from_row(row: sqlite3.Row) -> dict:
-    item = {"id": row["id"], "name": row["name"]}
     keys = set(row.keys())
+    item = {
+        "id": row["id"],
+        "name": row["name"],
+        "is_archive": int(row["is_archive"] or 0) if "is_archive" in keys else 0,
+    }
     for field in TEXT_FIELDS:
         item[field] = "" if field not in keys or row[field] is None else str(row[field])
     for field in FLAG_FIELDS:
@@ -394,7 +429,7 @@ def get_type(type_id: int) -> dict | None:
     return None if row is None else _type_from_row(row)
 
 
-def add_type(name: str) -> int:
+def add_type(name: str, is_archive: bool = False) -> int:
     with _lock:
         connection = _connect()
         columns = _columns(connection, "pelengator_types")
@@ -407,6 +442,9 @@ def add_type(name: str) -> int:
             if field in columns:
                 fields.append(field)
                 values.append("")
+        if "is_archive" in columns:
+            fields.append("is_archive")
+            values.append(1 if is_archive else 0)
         placeholders = ", ".join("?" for _ in fields)
         field_sql = ", ".join(fields)
         cursor = connection.execute(
@@ -419,7 +457,42 @@ def add_type(name: str) -> int:
     return type_id
 
 
-def list_pelengators() -> list[dict]:
+def set_type_archive(type_id: int, is_archive: bool) -> bool:
+    with _lock:
+        connection = _connect()
+        columns = _columns(connection, "pelengator_types")
+        if "is_archive" not in columns:
+            connection.close()
+            return False
+        cursor = connection.execute(
+            "UPDATE pelengator_types SET is_archive = ? WHERE id = ?",
+            (1 if is_archive else 0, type_id),
+        )
+        connection.commit()
+        ok = cursor.rowcount > 0
+        connection.close()
+    return ok
+
+
+def set_pelengator_archived(pelengator_id: int, archived: bool) -> bool:
+    with _lock:
+        connection = _connect()
+        columns = _columns(connection, "pelengators")
+        if "is_archived" not in columns:
+            connection.close()
+            return False
+        cursor = connection.execute(
+            "UPDATE pelengators SET is_archived = ? WHERE id = ?",
+            (1 if archived else 0, pelengator_id),
+        )
+        connection.commit()
+        ok = cursor.rowcount > 0
+        connection.close()
+    return ok
+
+
+def list_pelengators(*, archived: bool = False) -> list[dict]:
+    archive_flag = 1 if archived else 0
     with _lock:
         connection = _connect()
         rows = connection.execute(
@@ -430,6 +503,7 @@ def list_pelengators() -> list[dict]:
                 pelengator_types.name AS type_name,
                 pelengators.location AS location,
                 pelengators.reserved AS reserved,
+                COALESCE(pelengators.is_archived, 0) AS is_archived,
                 (
                     SELECT COUNT(*) FROM errors
                     WHERE errors.pelengator_id = pelengators.id
@@ -437,8 +511,10 @@ def list_pelengators() -> list[dict]:
                 ) AS error_count
             FROM pelengators
             JOIN pelengator_types ON pelengator_types.id = pelengators.type_id
-            ORDER BY pelengators.id
-            """
+            WHERE COALESCE(pelengators.is_archived, 0) = ?
+            ORDER BY pelengator_types.id, pelengators.id
+            """,
+            (archive_flag,),
         ).fetchall()
         connection.close()
     return [
@@ -448,6 +524,7 @@ def list_pelengators() -> list[dict]:
             "type_name": row["type_name"],
             "location": "" if row["location"] is None else str(row["location"]),
             "reserved": "" if row["reserved"] is None else str(row["reserved"]),
+            "is_archived": int(row["is_archived"] or 0),
             "error_count": row["error_count"],
         }
         for row in rows
@@ -501,6 +578,12 @@ def add_pelengator(pelengator_id: int, type_id: int) -> str | None:
         if "location" in pel_columns:
             fields.append("location")
             values.append(DEFAULT_LOCATION)
+        if "is_archived" in pel_columns:
+            archived = 0
+            if "is_archive" in tpl_keys and int(tpl["is_archive"] or 0):
+                archived = 1
+            fields.append("is_archived")
+            values.append(archived)
 
         placeholders = ", ".join("?" for _ in fields)
         connection.execute(
@@ -546,6 +629,9 @@ def get_pelengator(pelengator_id: int) -> dict | None:
             None
             if "reserved_user_id" not in keys or row["reserved_user_id"] is None
             else int(row["reserved_user_id"])
+        ),
+        "is_archived": (
+            int(row["is_archived"] or 0) if "is_archived" in keys else 0
         ),
         "values": {},
         "type_values": {},
@@ -679,19 +765,25 @@ def counts() -> dict:
             """
             SELECT
                 (SELECT COUNT(*) FROM pelengator_types) AS types,
-                (SELECT COUNT(*) FROM pelengators) AS pelengators,
+                (SELECT COUNT(*) FROM pelengators WHERE COALESCE(is_archived, 0) = 0) AS pelengators,
+                (SELECT COUNT(*) FROM pelengators WHERE COALESCE(is_archived, 0) = 1) AS archived,
                 (SELECT COUNT(*) FROM errors WHERE COALESCE(is_deleted, 0) = 0) AS errors,
                 (SELECT COUNT(*) FROM errors WHERE kind = 'hardware' AND COALESCE(is_deleted, 0) = 0) AS hardware,
-                (SELECT COUNT(*) FROM errors WHERE kind = 'soft' AND COALESCE(is_deleted, 0) = 0) AS soft
+                (SELECT COUNT(*) FROM errors WHERE kind = 'soft' AND COALESCE(is_deleted, 0) = 0) AS soft,
+                (SELECT COUNT(*) FROM stock_items) AS stock_items,
+                (SELECT COALESCE(SUM(qty), 0) FROM stock_lots) AS stock_qty
             """
         ).fetchone()
         connection.close()
     return {
         "types": row["types"],
         "pelengators": row["pelengators"],
+        "archived": row["archived"],
         "errors": row["errors"],
         "hardware": row["hardware"],
         "soft": row["soft"],
+        "stock_items": row["stock_items"],
+        "stock_qty": row["stock_qty"],
     }
 
 
@@ -1576,6 +1668,347 @@ def set_user_status(telegram_id: int, status: str) -> bool:
         updated = cursor.rowcount > 0
         connection.close()
     return updated
+
+
+MAX_STOCK_QTY = 1_000_000
+MAX_STOCK_NAME = 80
+
+
+def letter_shift_score(left: str, right: str) -> int:
+    """Max matching letters across all alignments; case-insensitive."""
+    a = (left or "").casefold()
+    b = (right or "").casefold()
+    if not a or not b:
+        return 0
+    best = 0
+    for shift in range(-len(b) + 1, len(a)):
+        matched = 0
+        for i, ch in enumerate(a):
+            j = i - shift
+            if 0 <= j < len(b) and ch == b[j]:
+                matched += 1
+        if matched > best:
+            best = matched
+    return best
+
+
+def normalize_stock_text(raw: str | None) -> str:
+    return " ".join((raw or "").split())
+
+
+def parse_stock_qty(raw: str | None) -> int | None:
+    text = (raw or "").strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if value < 1 or value > MAX_STOCK_QTY:
+        return None
+    return value
+
+
+def _stock_item_from_row(row: sqlite3.Row, lots: list[dict]) -> dict:
+    keys = set(row.keys())
+    total = sum(int(lot["qty"]) for lot in lots)
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "total": total,
+        "lots": lots,
+        "photo_file_id": (
+            ""
+            if "photo_file_id" not in keys or row["photo_file_id"] is None
+            else str(row["photo_file_id"])
+        ),
+    }
+
+
+def _lots_for_item(connection: sqlite3.Connection, item_id: int) -> list[dict]:
+    rows = connection.execute(
+        """
+        SELECT location, qty
+        FROM stock_lots
+        WHERE item_id = ?
+        ORDER BY CASE WHEN location = ? THEN 0 ELSE 1 END, location
+        """,
+        (item_id, DEFAULT_LOCATION),
+    ).fetchall()
+    return [
+        {"location": row["location"], "qty": int(row["qty"])}
+        for row in rows
+    ]
+
+
+def list_stock_items() -> list[dict]:
+    with _lock:
+        connection = _connect()
+        rows = connection.execute(
+            "SELECT * FROM stock_items ORDER BY name, id"
+        ).fetchall()
+        items = [
+            _stock_item_from_row(row, _lots_for_item(connection, row["id"]))
+            for row in rows
+        ]
+        connection.close()
+    return items
+
+
+def get_stock_item(item_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM stock_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return None
+        item = _stock_item_from_row(row, _lots_for_item(connection, item_id))
+        connection.close()
+    return item
+
+
+def find_stock_item_by_name(name: str) -> dict | None:
+    key = normalize_stock_text(name).casefold()
+    if not key:
+        return None
+    with _lock:
+        connection = _connect()
+        rows = connection.execute(
+            "SELECT * FROM stock_items ORDER BY id"
+        ).fetchall()
+        found = None
+        for row in rows:
+            if normalize_stock_text(row["name"]).casefold() == key:
+                found = _stock_item_from_row(row, _lots_for_item(connection, row["id"]))
+                break
+        connection.close()
+    return found
+
+
+def best_stock_match(query: str) -> dict | None:
+    query = normalize_stock_text(query)
+    if not query:
+        return None
+    best_item = None
+    best_score = 0
+    for item in list_stock_items():
+        score = letter_shift_score(query, item["name"])
+        if score > best_score:
+            best_score = score
+            best_item = item
+    if best_item is None or best_score <= 0:
+        return None
+    return {**best_item, "match_score": best_score}
+
+
+def add_stock_item(name: str) -> int | None:
+    name = normalize_stock_text(name)
+    if not name or len(name) > MAX_STOCK_NAME:
+        return None
+    existing = find_stock_item_by_name(name)
+    if existing is not None:
+        return existing["id"]
+    with _lock:
+        connection = _connect()
+        cursor = connection.execute(
+            "INSERT INTO stock_items (name) VALUES (?)",
+            (name,),
+        )
+        connection.commit()
+        item_id = cursor.lastrowid
+        connection.close()
+    return item_id
+
+
+def list_known_locations() -> list[str]:
+    seen: list[str] = []
+    seen_exact: set[str] = set()
+
+    def add(raw: str | None) -> None:
+        loc = normalize_stock_text(raw)
+        if not loc or loc in seen_exact:
+            return
+        seen_exact.add(loc)
+        seen.append(loc)
+
+    add(DEFAULT_LOCATION)
+    with _lock:
+        connection = _connect()
+        for row in connection.execute(
+            "SELECT DISTINCT location FROM stock_lots ORDER BY location"
+        ).fetchall():
+            add(row["location"])
+        if "location" in _columns(connection, "pelengators"):
+            for row in connection.execute(
+                """
+                SELECT DISTINCT location FROM pelengators
+                WHERE location IS NOT NULL AND location != ''
+                ORDER BY location
+                """
+            ).fetchall():
+                add(row["location"])
+        connection.close()
+    return seen
+
+
+def lot_qty(item: dict, location: str) -> int:
+    location = normalize_stock_text(location)
+    for lot in item.get("lots") or []:
+        if str(lot["location"]) == location:
+            return int(lot["qty"])
+    return 0
+
+
+def _adjust_lot(
+    connection: sqlite3.Connection,
+    item_id: int,
+    location: str,
+    delta: int,
+) -> str | None:
+    row = connection.execute(
+        "SELECT qty FROM stock_lots WHERE item_id = ? AND location = ?",
+        (item_id, location),
+    ).fetchone()
+    current = 0 if row is None else int(row["qty"])
+    new = current + delta
+    if new < 0:
+        return "not_enough"
+    if new == 0:
+        connection.execute(
+            "DELETE FROM stock_lots WHERE item_id = ? AND location = ?",
+            (item_id, location),
+        )
+    elif row is None:
+        connection.execute(
+            "INSERT INTO stock_lots (item_id, location, qty) VALUES (?, ?, ?)",
+            (item_id, location, new),
+        )
+    else:
+        connection.execute(
+            "UPDATE stock_lots SET qty = ? WHERE item_id = ? AND location = ?",
+            (new, item_id, location),
+        )
+    return None
+
+
+def add_stock(item_id: int, location: str, qty: int) -> str | None:
+    location = normalize_stock_text(location)
+    if not location:
+        return "bad_location"
+    if qty < 1 or qty > MAX_STOCK_QTY:
+        return "bad_qty"
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT id FROM stock_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return "not_found"
+        error = _adjust_lot(connection, item_id, location, qty)
+        if error:
+            connection.close()
+            return error
+        connection.commit()
+        connection.close()
+    return None
+
+
+def move_stock(item_id: int, from_location: str, to_location: str, qty: int) -> str | None:
+    from_location = normalize_stock_text(from_location)
+    to_location = normalize_stock_text(to_location)
+    if not from_location or not to_location:
+        return "bad_location"
+    if from_location == to_location:
+        return "same_location"
+    if qty < 1 or qty > MAX_STOCK_QTY:
+        return "bad_qty"
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT id FROM stock_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return "not_found"
+        error = _adjust_lot(connection, item_id, from_location, -qty)
+        if error:
+            connection.close()
+            return error
+        error = _adjust_lot(connection, item_id, to_location, qty)
+        if error:
+            connection.close()
+            return error
+        connection.commit()
+        connection.close()
+    return None
+
+
+def remove_stock(item_id: int, location: str, qty: int) -> str | None:
+    location = normalize_stock_text(location)
+    if not location:
+        return "bad_location"
+    if qty < 1 or qty > MAX_STOCK_QTY:
+        return "bad_qty"
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT id FROM stock_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return "not_found"
+        error = _adjust_lot(connection, item_id, location, -qty)
+        if error:
+            connection.close()
+            return error
+        connection.commit()
+        connection.close()
+    return None
+
+
+def set_stock_photo(item_id: int, file_id: str | None) -> bool:
+    value = "" if not file_id else str(file_id)
+    with _lock:
+        connection = _connect()
+        columns = _columns(connection, "stock_items")
+        if "photo_file_id" not in columns:
+            connection.close()
+            return False
+        cursor = connection.execute(
+            "UPDATE stock_items SET photo_file_id = ? WHERE id = ?",
+            (value, item_id),
+        )
+        connection.commit()
+        ok = cursor.rowcount > 0
+        connection.close()
+    return ok
+
+
+def delete_stock_item(item_id: int) -> bool:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT id FROM stock_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return False
+        connection.execute(
+            "DELETE FROM stock_lots WHERE item_id = ?",
+            (item_id,),
+        )
+        connection.execute(
+            "DELETE FROM stock_items WHERE id = ?",
+            (item_id,),
+        )
+        connection.commit()
+        connection.close()
+    return True
 
 
 def booking_label(user: dict, telegram_username: str | None = None) -> str:

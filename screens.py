@@ -139,6 +139,16 @@ def pel_id_link(bot_username: str | None, pelengator_id: int) -> str:
     )
 
 
+def stock_name_link(bot_username: str | None, item_id: int, name: str) -> str:
+    label = escape(name)
+    if not bot_username:
+        return f"<b>{label}</b>"
+    return (
+        f'<a href="https://t.me/{bot_username}?start=s{item_id}">'
+        f"{label}</a>"
+    )
+
+
 def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text, callback_data=data)
 
@@ -164,6 +174,8 @@ def home_screen(is_admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
         "📡 <b>Мониторинг пеленгаторов</b>\n\n"
         f"Шаблоны: <b>{stats['types']}</b>\n"
         f"Пеленгаторы: <b>{stats['pelengators']}</b>\n"
+        f"Архив: <b>{stats['archived']}</b>\n"
+        f"Склад: <b>{stats['stock_items']}</b> наим. · <b>{stats['stock_qty']}</b> шт.\n"
         f"Ошибки: <b>{stats['errors']}</b>"
         f"  <i>(🔩 {stats['hardware']} · 💾 {stats['soft']})</i>"
     )
@@ -173,7 +185,11 @@ def home_screen(is_admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
             _btn("Пеленгаторы", "nav:pels"),
         ],
         [
+            _btn("📦 Архив", "nav:arch"),
             _btn("⚠️ Ошибки", "nav:errs"),
+        ],
+        [
+            _btn("🔧 Склад", "nav:stock"),
             _btn("Профиль", "nav:profile"),
         ],
     ]
@@ -186,6 +202,13 @@ def home_screen(is_admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
 # Шаблоны
 # ──────────────────────────────────────────
 
+def _type_button_label(item: dict) -> str:
+    name = _short(item["name"])
+    if item.get("is_archive"):
+        return f"{item['id']}. 📦 {name}"
+    return f"{item['id']}. {name}"
+
+
 def types_screen() -> tuple[str, InlineKeyboardMarkup]:
     types = storage.list_types()
     if types:
@@ -194,10 +217,11 @@ def types_screen() -> tuple[str, InlineKeyboardMarkup]:
         text = "<b>Шаблоны пеленгаторов</b>\nПока пусто — добавьте первый шаблон."
 
     rows = [
-        [_btn(f"{item['id']}. {_short(item['name'])}", f"type:v:{item['id']}")]
+        [_btn(_type_button_label(item), f"type:v:{item['id']}")]
         for item in types
     ]
     rows.append([_btn("＋ Новый шаблон", "type:add")])
+    rows.append([_btn("＋ Архивный шаблон", "type:add:a")])
     rows.append([_btn("← Меню", "nav:home")])
     return text, _markup(rows)
 
@@ -207,6 +231,7 @@ def type_card(type_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     if item is None:
         return None
     used = storage.count_pelengators_of_type(type_id)
+    archive = bool(item.get("is_archive"))
     lines = [
         f"<b>Шаблон #{item['id']}</b> — {escape(item['name'])}",
         "",
@@ -215,12 +240,21 @@ def type_card(type_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
         *_hw_flag_lines(item),
         "",
         f"Пеленгаторов на шаблоне: <b>{used}</b>",
+        f"Архивный шаблон: <b>{'да' if archive else 'нет'}</b>",
     ]
+    if archive:
+        lines.append("Новые пеленгаторы этого шаблона сразу попадают в архив.")
     keyboard = _markup(
         [
             [
                 _btn("✏️ Изменить", f"type:e:{type_id}"),
                 _btn("🗑 Удалить", f"type:d:{type_id}"),
+            ],
+            [
+                _btn(
+                    "Сделать обычным" if archive else "Сделать архивным",
+                    f"type:ar:{type_id}",
+                )
             ],
             [_btn("← К шаблонам", "nav:types")],
         ]
@@ -292,14 +326,23 @@ def confirm_delete_type(type_id: int) -> tuple[str, InlineKeyboardMarkup] | None
 # Пеленгаторы
 # ──────────────────────────────────────────
 
-def pelengators_screen(bot_username: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
-    items = storage.list_pelengators()
+def pelengators_screen(
+    bot_username: str | None = None,
+    *,
+    archived: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
+    items = storage.list_pelengators(archived=archived)
+    title = "Архивные пеленгаторы" if archived else "Пеленгаторы"
     if items:
-        lines = ["<b>Пеленгаторы</b>", ""]
+        lines = [f"<b>{title}</b>"]
+        current_type = None
         for item in items:
+            if item["type_id"] != current_type:
+                current_type = item["type_id"]
+                lines.append("")
+                lines.append(f"<b>{escape(item['type_name'])}</b>")
             errors = item["error_count"]
             err_part = f"  ⚠️ <b>{errors} ош.</b>" if errors else ""
-            # Проверяем наличие изменений относительно шаблона
             full = storage.get_pelengator(item["id"])
             changed_mark = ""
             if full and full.get("type_values"):
@@ -308,7 +351,7 @@ def pelengators_screen(bot_username: str | None = None) -> tuple[str, InlineKeyb
             loc = item.get("location") or "—"
             reserved = item.get("reserved") or ""
             lines.append(
-                f"{pel_id_link(bot_username, item['id'])} · {escape(_short(item['type_name'], 22))} · {escape(_short(loc, 20))}{err_part}{changed_mark}"
+                f"{pel_id_link(bot_username, item['id'])} · {escape(_short(loc, 24))}{err_part}{changed_mark}"
             )
             if reserved:
                 lines.append(f"    ❌ {escape(reserved)}")
@@ -317,14 +360,149 @@ def pelengators_screen(bot_username: str | None = None) -> tuple[str, InlineKeyb
         lines.append("")
         lines.append("<i>Нажмите номер или введите его, чтобы открыть карточку.</i>")
         text = "\n".join(lines)
+    elif archived:
+        text = f"<b>{title}</b>\nАрхив пуст."
     else:
-        text = "<b>Пеленгаторы</b>\nПока пусто — добавьте первое устройство."
+        text = f"<b>{title}</b>\nПока пусто — добавьте первое устройство."
 
+    add_cb = "pel:adda" if archived else "pel:add"
     keyboard = _markup([
-        [_btn("＋ Новый пеленгатор", "pel:add")],
+        [_btn("＋ Новый пеленгатор", add_cb)],
         [_btn("← Меню", "nav:home")],
     ])
     return text, keyboard
+
+
+def stock_hub_screen(bot_username: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    items = storage.list_stock_items()
+    if items:
+        lines = ["<b>Склад</b>", ""]
+        for item in items:
+            lines.append(
+                f"{stock_name_link(bot_username, item['id'], item['name'])} · {item['total']} шт."
+            )
+            if item["lots"]:
+                for lot in item["lots"]:
+                    lines.append(
+                        f"    {escape(lot['location'])} — {lot['qty']}"
+                    )
+            else:
+                lines.append("    пусто")
+            lines.append("")
+        lines.append("<i>Нажмите название, чтобы открыть карточку.</i>")
+        text = "\n".join(lines)
+    else:
+        text = "<b>Склад</b>\nПока пусто — добавьте первый товар."
+    rows = [
+        [_btn("＋ Добавить", "stk:in")],
+        [_btn("← Меню", "nav:home")],
+    ]
+    return text, _markup(rows)
+
+
+def stock_item_card(item_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    item = storage.get_stock_item(item_id)
+    if item is None:
+        return None
+    lines = [
+        f"<b>{escape(item['name'])}</b>",
+        f"Всего: <b>{item['total']}</b> шт.",
+        "",
+        "<b>По местам:</b>",
+    ]
+    if item["lots"]:
+        for lot in item["lots"]:
+            lines.append(f"{escape(lot['location'])} — <b>{lot['qty']}</b>")
+    else:
+        lines.append("пусто")
+    photo_row = [_btn("📷 Фото", f"stk:ph:{item_id}")]
+    if item.get("photo_file_id"):
+        photo_row.append(_btn("Убрать фото", f"stk:px:{item_id}"))
+    keyboard = _markup(
+        [
+            [_btn("＋ Добавить", f"stk:in:{item_id}")],
+            [
+                _btn("📍 Переместить", f"stk:mv:{item_id}"),
+                _btn("↩️ Вернуть", f"stk:rt:{item_id}"),
+            ],
+            [_btn("➖ Списать", f"stk:rm:{item_id}")],
+            photo_row,
+            [_btn("🗑 Удалить", f"stk:d:{item_id}")],
+            [_btn("← К складу", "nav:stock")],
+        ]
+    )
+    return "\n".join(lines), keyboard
+
+
+def confirm_delete_stock_item(item_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    item = storage.get_stock_item(item_id)
+    if item is None:
+        return None
+    extra = ""
+    if item["total"]:
+        extra = f" На складе ещё <b>{item['total']}</b> шт."
+    text = f"🗑 Удалить карточку «{escape(item['name'])}»?{extra}"
+    keyboard = _markup(
+        [
+            [
+                _btn("Да, удалить", f"stk:do:{item_id}"),
+                _btn("Отмена", f"stk:v:{item_id}"),
+            ]
+        ]
+    )
+    return text, keyboard
+
+
+def stock_photo_prompt(item_id: int, name: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        f"Пришлите фото для «{escape(name)}».\n\n"
+        "<i>Отправьте снимок сообщением</i>"
+    )
+    keyboard = _markup([[_btn("Отмена", f"stk:v:{item_id}")]])
+    return text, keyboard
+
+
+def stock_add_choice_screen(query: str, best: dict | None) -> tuple[str, InlineKeyboardMarkup]:
+    lines = [f"Точного совпадения для «{escape(query)}» нет."]
+    rows: list[list] = []
+    if best:
+        extra = f" · {best['total']} шт."
+        lines.append(
+            f"Похожий товар: <b>{escape(best['name'])}</b>{extra}"
+        )
+        rows.append(
+            [
+                _btn(
+                    f"В «{_short(best['name'], 24)}»",
+                    f"stk:use:{best['id']}",
+                )
+            ]
+        )
+    rows.append([_btn(f"Создать «{_short(query, 28)}»", "stk:ok")])
+    rows.append([_btn("Отмена", "nav:stock")])
+    return "\n".join(lines), _markup(rows)
+
+
+def stock_lot_pick_screen(
+    item: dict,
+    *,
+    callback_prefix: str,
+    title: str,
+    back: str,
+    lots: list[dict] | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    shown = lots if lots is not None else item.get("lots") or []
+    rows = [
+        [
+            _btn(
+                _short(f"{lot['location']} · {lot['qty']} шт.", 36),
+                f"{callback_prefix}{index}",
+            )
+        ]
+        for index, lot in enumerate(shown)
+    ]
+    rows.append([_btn("Отмена", back)])
+    return title, _markup(rows)
 
 
 def pelengator_card(
@@ -337,16 +515,23 @@ def pelengator_card(
         return None
     errors = storage.list_errors_for_pelengator(pelengator_id)
     tv = item.get("type_values")
+    archived = bool(item.get("is_archived"))
     lines = [
         f"<b>Пеленгатор #{item['id']}</b>",
         f"Шаблон: <b>{escape(item['type_name'])}</b>",
-        *_status_lines(item),
-        *_check_status_lines(pelengator_id),
-        "",
-        *_hw_text_lines(item["values"], tv),
-        "",
-        *_hw_flag_lines(item["values"], tv),
     ]
+    if archived:
+        lines.append("📦 <b>В архиве</b>")
+    lines.extend(
+        [
+            *_status_lines(item),
+            *_check_status_lines(pelengator_id),
+            "",
+            *_hw_text_lines(item["values"], tv),
+            "",
+            *_hw_flag_lines(item["values"], tv),
+        ]
+    )
     mine = (
         viewer_id is not None
         and item.get("reserved_user_id") is not None
@@ -372,7 +557,18 @@ def pelengator_card(
                 _btn("Сменить шаблон", f"pel:ct:{pelengator_id}"),
                 _btn("🗑 Удалить", f"pel:d:{pelengator_id}"),
             ],
-            [_btn("← К пеленгаторам", "nav:pels")],
+            [
+                _btn(
+                    "📤 Из архива" if archived else "📦 В архив",
+                    f"pel:ar:{pelengator_id}",
+                )
+            ],
+            [
+                _btn(
+                    "← К архиву" if archived else "← К пеленгаторам",
+                    "nav:arch" if archived else "nav:pels",
+                )
+            ],
         ]
     )
     keyboard = _markup(keyboard_rows)
@@ -551,7 +747,7 @@ def pelengator_pick_type_screen(
         return text, _markup([[_btn("К шаблонам", "nav:types"), _btn("← Меню", "nav:home")]])
 
     rows = [
-        [_btn(f"{item['id']}. {_short(item['name'])}", f"{callback_prefix}{item['id']}")]
+        [_btn(_type_button_label(item), f"{callback_prefix}{item['id']}")]
         for item in types
     ]
     rows.append([_btn("← Назад", back)])
@@ -817,11 +1013,16 @@ def pick_pelengator_for_error(kind: str) -> tuple[str, InlineKeyboardMarkup]:
     if not items:
         text = "Сначала добавьте пеленгатор."
         return text, _markup([[_btn("К пеленгаторам", "nav:pels")]])
-    lines = [f"<b>Куда записать ошибку ({label})?</b>", ""]
+    lines = [f"<b>Куда записать ошибку ({label})?</b>"]
+    current_type = None
     for item in items:
+        if item["type_id"] != current_type:
+            current_type = item["type_id"]
+            lines.append("")
+            lines.append(f"<b>{escape(item['type_name'])}</b>")
         loc = item.get("location") or "—"
         lines.append(
-            f"<code>#{item['id']}</code> · {escape(_short(item['type_name'], 22))} · {escape(_short(loc, 20))}"
+            f"<code>#{item['id']}</code> · {escape(_short(loc, 24))}"
         )
     lines.append("")
     lines.append("<i>Введите номер пеленгатора сообщением.</i>")
