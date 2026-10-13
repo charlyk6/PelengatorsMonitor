@@ -1,11 +1,20 @@
+import json
 import sqlite3
-from datetime import datetime
+from contextvars import ContextVar
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 
 DB_PATH = Path(__file__).resolve().parent / "pelengators.db"
 
 _lock = Lock()
+_pending_activity: list[dict] = []
+_activity_actor_id: ContextVar[int | None] = ContextVar(
+    "activity_actor_id", default=None
+)
+_activity_actor_name: ContextVar[str] = ContextVar(
+    "activity_actor_name", default=""
+)
 
 TEXT_FIELDS = {
     "mic_distance": "Расстояние между микрофонами",
@@ -234,6 +243,98 @@ def _ensure_column(
         )
 
 
+ACTIVITY_PAGE_SIZE = 12
+ACTIVITY_FILTER_PAGE_SIZE = 10
+
+ACTIVITY_ACTIONS = [
+    ("pel.created", "Пеленгатор создан"),
+    ("pel.moved", "Пеленгатор перемещён"),
+    ("pel.reserved", "Бронь"),
+    ("pel.released", "Бронь снята"),
+    ("pel.type_changed", "Смена шаблона"),
+    ("pel.archived", "В архив"),
+    ("pel.restored", "Из архива"),
+    ("pel.deleted", "Пеленгатор удалён"),
+    ("error.created", "Ошибка добавлена"),
+    ("error.deleted", "Ошибка удалена"),
+    ("stock.added", "Приход"),
+    ("stock.moved", "Перемещение склада"),
+    ("stock.returned", "Возврат"),
+    ("stock.removed", "Списание"),
+    ("stock.deleted", "Карточка удалена"),
+]
+ACTIVITY_ACTION_LABELS = {key: label for key, label in ACTIVITY_ACTIONS}
+ACTIVITY_ACTION_KEYS = [key for key, _label in ACTIVITY_ACTIONS]
+ACTIVITY_TIME_PRESETS = {
+    "today": "Сегодня",
+    "yesterday": "Вчера",
+    "7d": "7 дней",
+    "30d": "30 дней",
+    "custom": "Свой период",
+}
+
+
+def set_activity_actor(user_id: int | None, name: str = "") -> None:
+    _activity_actor_id.set(user_id)
+    _activity_actor_name.set(name or "")
+
+
+def _log_activity(
+    connection: sqlite3.Connection,
+    entity_type: str,
+    entity_id: int,
+    action: str,
+    payload: dict | None = None,
+) -> None:
+    created_at = datetime.now().isoformat(timespec="seconds")
+    actor_id = _activity_actor_id.get()
+    actor_name = _activity_actor_name.get() or ""
+    data = payload or {}
+    connection.execute(
+        """
+        INSERT INTO activity (
+            created_at, actor_id, actor_name,
+            entity_type, entity_id, action, payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            created_at,
+            actor_id,
+            actor_name,
+            entity_type,
+            int(entity_id),
+            action,
+            json.dumps(data, ensure_ascii=False),
+        ),
+    )
+    _pending_activity.append(
+        {
+            "created_at": created_at,
+            "actor_id": None if actor_id is None else int(actor_id),
+            "actor_name": actor_name,
+            "entity_type": entity_type,
+            "entity_id": int(entity_id),
+            "action": action,
+            "payload": data,
+        }
+    )
+
+
+def drain_activity_events() -> list[dict]:
+    with _lock:
+        events = list(_pending_activity)
+        _pending_activity.clear()
+    return events
+
+
+def _stock_name_locked(connection: sqlite3.Connection, item_id: int) -> str:
+    row = connection.execute(
+        "SELECT name FROM stock_items WHERE id = ?",
+        (item_id,),
+    ).fetchone()
+    return "" if row is None else str(row["name"] or "")
+
+
 def init_db() -> None:
     with _lock:
         connection = _connect()
@@ -294,6 +395,17 @@ def init_db() -> None:
                 PRIMARY KEY (item_id, location),
                 FOREIGN KEY (item_id) REFERENCES stock_items(id)
             );
+
+            CREATE TABLE IF NOT EXISTS activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                actor_id INTEGER,
+                actor_name TEXT NOT NULL DEFAULT '',
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}'
+            );
             """
         )
         error_columns = _columns(connection, "errors")
@@ -320,6 +432,12 @@ def init_db() -> None:
             "users",
             "status",
             "TEXT NOT NULL DEFAULT 'active'",
+        )
+        _ensure_column(
+            connection,
+            "users",
+            "notify_activity",
+            "INTEGER NOT NULL DEFAULT 0",
         )
 
         for name in TEXT_FIELDS:
@@ -485,18 +603,22 @@ def set_pelengator_archived(pelengator_id: int, archived: bool) -> bool:
             "UPDATE pelengators SET is_archived = ? WHERE id = ?",
             (1 if archived else 0, pelengator_id),
         )
+        if cursor.rowcount > 0:
+            _log_activity(
+                connection,
+                "pelengator",
+                pelengator_id,
+                "pel.archived" if archived else "pel.restored",
+                {},
+            )
         connection.commit()
         ok = cursor.rowcount > 0
         connection.close()
     return ok
 
 
-def list_pelengators(*, archived: bool = False) -> list[dict]:
-    archive_flag = 1 if archived else 0
-    with _lock:
-        connection = _connect()
-        rows = connection.execute(
-            """
+def list_pelengators(*, archived: bool | None = False) -> list[dict]:
+    sql = """
             SELECT
                 pelengators.id AS id,
                 pelengators.type_id AS type_id,
@@ -511,11 +633,22 @@ def list_pelengators(*, archived: bool = False) -> list[dict]:
                 ) AS error_count
             FROM pelengators
             JOIN pelengator_types ON pelengator_types.id = pelengators.type_id
+    """
+    args: list = []
+    if archived is None:
+        sql += """
+            ORDER BY COALESCE(pelengators.is_archived, 0),
+                     pelengator_types.id, pelengators.id
+        """
+    else:
+        sql += """
             WHERE COALESCE(pelengators.is_archived, 0) = ?
             ORDER BY pelengator_types.id, pelengators.id
-            """,
-            (archive_flag,),
-        ).fetchall()
+        """
+        args.append(1 if archived else 0)
+    with _lock:
+        connection = _connect()
+        rows = connection.execute(sql, args).fetchall()
         connection.close()
     return [
         {
@@ -589,6 +722,18 @@ def add_pelengator(pelengator_id: int, type_id: int) -> str | None:
         connection.execute(
             f"INSERT INTO pelengators ({', '.join(fields)}) VALUES ({placeholders})",
             values,
+        )
+        _log_activity(
+            connection,
+            "pelengator",
+            pelengator_id,
+            "pel.created",
+            {
+                "type_id": type_id,
+                "type_name": str(tpl["name"] or ""),
+                "location": DEFAULT_LOCATION if "location" in pel_columns else "",
+                "archived": bool(archived) if "is_archived" in pel_columns else False,
+            },
         )
         connection.commit()
         connection.close()
@@ -752,8 +897,23 @@ def add_error(
             f"INSERT INTO errors ({', '.join(fields)}) VALUES ({placeholders})",
             values,
         )
-        connection.commit()
         error_id = cursor.lastrowid
+        if error_id:
+            _log_activity(
+                connection,
+                "error",
+                error_id,
+                "error.created",
+                {
+                    "pelengator_id": pelengator_id,
+                    "kind": kind,
+                    "description": description,
+                    "hw_class": hw_class or "",
+                    "hw_part": hw_part or "",
+                    "priority": priority,
+                },
+            )
+        connection.commit()
         connection.close()
     return error_id
 
@@ -875,12 +1035,28 @@ def set_pelengator_device_field(pelengator_id: int, field: str, value: str) -> b
         return False
     with _lock:
         connection = _connect()
+        old_row = connection.execute(
+            f"SELECT {field} FROM pelengators WHERE id = ?",
+            (pelengator_id,),
+        ).fetchone()
+        if old_row is None:
+            connection.close()
+            return False
+        old_value = "" if old_row[field] is None else str(old_row[field])
         cursor = connection.execute(
             f"UPDATE pelengators SET {field} = ? WHERE id = ?",
             (value, pelengator_id),
         )
-        connection.commit()
         updated = cursor.rowcount > 0
+        if updated and field == "location" and old_value != value:
+            _log_activity(
+                connection,
+                "pelengator",
+                pelengator_id,
+                "pel.moved",
+                {"from": old_value, "to": value},
+            )
+        connection.commit()
         connection.close()
     return updated
 
@@ -896,6 +1072,14 @@ def reserve_pelengator(pelengator_id: int, user_id: int, display_name: str) -> b
             """,
             (display_name, user_id, pelengator_id),
         )
+        if cursor.rowcount > 0:
+            _log_activity(
+                connection,
+                "pelengator",
+                pelengator_id,
+                "pel.reserved",
+                {"holder_id": user_id, "holder_name": display_name},
+            )
         connection.commit()
         updated = cursor.rowcount > 0
         connection.close()
@@ -920,6 +1104,35 @@ def release_pelengator(pelengator_id: int, user_id: int) -> str | None:
         if int(owner) != user_id:
             connection.close()
             return "not_owner"
+        holder_row = connection.execute(
+            "SELECT reserved FROM pelengators WHERE id = ?",
+            (pelengator_id,),
+        ).fetchone()
+        holder_name = "" if holder_row is None else str(holder_row["reserved"] or "")
+        started = connection.execute(
+            """
+            SELECT created_at FROM activity
+            WHERE entity_type = 'pelengator'
+              AND entity_id = ?
+              AND action = 'pel.reserved'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (pelengator_id,),
+        ).fetchone()
+        started_at = "" if started is None else str(started["created_at"] or "")
+        ended_at = datetime.now().isoformat(timespec="seconds")
+        seconds = None
+        if started_at:
+            try:
+                seconds = int(
+                    (
+                        datetime.fromisoformat(ended_at)
+                        - datetime.fromisoformat(started_at)
+                    ).total_seconds()
+                )
+            except ValueError:
+                seconds = None
         connection.execute(
             """
             UPDATE pelengators
@@ -927,6 +1140,19 @@ def release_pelengator(pelengator_id: int, user_id: int) -> str | None:
             WHERE id = ?
             """,
             (pelengator_id,),
+        )
+        _log_activity(
+            connection,
+            "pelengator",
+            pelengator_id,
+            "pel.released",
+            {
+                "holder_id": int(owner),
+                "holder_name": holder_name,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "seconds": seconds,
+            },
         )
         connection.commit()
         connection.close()
@@ -1059,6 +1285,19 @@ def update_pelengator_type(pelengator_id: int, new_type_id: int) -> str | None:
             f"UPDATE pelengators SET {set_clause} WHERE id = ?",
             list(updates.values()) + [pelengator_id],
         )
+        old_name = str(old_tpl["name"] or "") if old_tpl is not None else ""
+        _log_activity(
+            connection,
+            "pelengator",
+            pelengator_id,
+            "pel.type_changed",
+            {
+                "from_type_id": int(device_row["type_id"]),
+                "from_type_name": old_name,
+                "to_type_id": new_type_id,
+                "to_type_name": str(new_tpl["name"] or ""),
+            },
+        )
         connection.commit()
         connection.close()
     return None
@@ -1067,6 +1306,18 @@ def update_pelengator_type(pelengator_id: int, new_type_id: int) -> str | None:
 def delete_pelengator(pelengator_id: int) -> bool:
     with _lock:
         connection = _connect()
+        snap = connection.execute(
+            """
+            SELECT
+                pelengators.location AS location,
+                pelengator_types.name AS type_name
+            FROM pelengators
+            LEFT JOIN pelengator_types
+                ON pelengator_types.id = pelengators.type_id
+            WHERE pelengators.id = ?
+            """,
+            (pelengator_id,),
+        ).fetchone()
         try:
             insp_ids = [
                 int(row["id"])
@@ -1095,6 +1346,17 @@ def delete_pelengator(pelengator_id: int) -> bool:
             "DELETE FROM pelengators WHERE id = ?",
             (pelengator_id,),
         )
+        if cursor.rowcount > 0:
+            _log_activity(
+                connection,
+                "pelengator",
+                pelengator_id,
+                "pel.deleted",
+                {
+                    "location": "" if snap is None else str(snap["location"] or ""),
+                    "type_name": "" if snap is None else str(snap["type_name"] or ""),
+                },
+            )
         connection.commit()
         deleted = cursor.rowcount > 0
         connection.close()
@@ -1105,6 +1367,10 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def now_iso() -> str:
+    return _now_iso()
+
+
 def format_check_time(iso: str | None) -> str:
     if not iso:
         return "—"
@@ -1112,6 +1378,235 @@ def format_check_time(iso: str | None) -> str:
         return datetime.fromisoformat(iso).strftime("%d.%m.%Y %H:%M")
     except ValueError:
         return iso
+
+
+def format_hold_duration(seconds: int | None) -> str:
+    if seconds is None or seconds < 0:
+        return ""
+    if seconds < 60:
+        return f"{seconds} с"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours = minutes // 60
+    rest = minutes % 60
+    if rest:
+        return f"{hours} ч {rest} мин"
+    return f"{hours} ч"
+
+
+def _int_id_list(raw) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in raw or []:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def parse_log_datetime(raw: str | None, *, end_of_day: bool = False) -> str | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            moment = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if fmt == "%d.%m.%Y" and end_of_day:
+            moment = moment.replace(hour=23, minute=59, second=59)
+        return moment.isoformat(timespec="seconds")
+    return None
+
+
+def normalize_activity_filters(filters: dict | None) -> dict:
+    src = filters if isinstance(filters, dict) else {}
+    out: dict = {}
+    pel_ids = _int_id_list(src.get("pel_ids"))
+    if pel_ids:
+        out["pel_ids"] = pel_ids
+    stock_ids = _int_id_list(src.get("stock_ids"))
+    if stock_ids:
+        out["stock_ids"] = stock_ids
+    actor_ids = _int_id_list(src.get("actor_ids"))
+    if actor_ids:
+        out["actor_ids"] = actor_ids
+    wanted = set(src.get("actions") or [])
+    actions = [key for key in ACTIVITY_ACTION_KEYS if key in wanted]
+    if actions:
+        out["actions"] = actions
+    preset = str(src.get("time_preset") or "")
+    time_from = str(src.get("time_from") or "")
+    time_to = str(src.get("time_to") or "")
+    if preset in ACTIVITY_TIME_PRESETS:
+        out["time_preset"] = preset
+        if preset == "custom":
+            if time_from:
+                out["time_from"] = time_from
+            if time_to:
+                out["time_to"] = time_to
+            if not time_from and not time_to:
+                out.pop("time_preset", None)
+    elif time_from or time_to:
+        out["time_preset"] = "custom"
+        if time_from:
+            out["time_from"] = time_from
+        if time_to:
+            out["time_to"] = time_to
+    return out
+
+
+def resolve_activity_time(filters: dict | None) -> tuple[str | None, str | None]:
+    src = filters if isinstance(filters, dict) else {}
+    preset = str(src.get("time_preset") or "")
+    now = datetime.now().replace(microsecond=0)
+    today = now.replace(hour=0, minute=0, second=0)
+    if preset == "today":
+        return today.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")
+    if preset == "yesterday":
+        start = today - timedelta(days=1)
+        end = today - timedelta(seconds=1)
+        return start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
+    if preset == "7d":
+        start = now - timedelta(days=7)
+        return start.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")
+    if preset == "30d":
+        start = now - timedelta(days=30)
+        return start.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")
+    time_from = str(src.get("time_from") or "") or None
+    time_to = str(src.get("time_to") or "") or None
+    return time_from, time_to
+
+
+def format_activity_range_label(filters: dict | None) -> str:
+    src = filters if isinstance(filters, dict) else {}
+    preset = str(src.get("time_preset") or "")
+    if preset in ACTIVITY_TIME_PRESETS and preset != "custom":
+        return ACTIVITY_TIME_PRESETS[preset].lower()
+    time_from, time_to = resolve_activity_time(src)
+    if not time_from and not time_to:
+        return ""
+    start = format_check_time(time_from) if time_from else "…"
+    end = format_check_time(time_to) if time_to else "…"
+    return f"{start} — {end}"
+
+
+def _activity_where(filters: dict | None) -> tuple[str, list]:
+    src = normalize_activity_filters(filters)
+    clauses: list[str] = []
+    args: list = []
+    entity_clauses: list[str] = []
+    pel_ids = src.get("pel_ids") or []
+    if pel_ids:
+        placeholders = ", ".join("?" for _ in pel_ids)
+        entity_clauses.append(
+            f"""(
+                (entity_type = 'pelengator' AND entity_id IN ({placeholders}))
+                OR (
+                    entity_type = 'error'
+                    AND CAST(json_extract(payload, '$.pelengator_id') AS INTEGER)
+                        IN ({placeholders})
+                )
+            )"""
+        )
+        args.extend(pel_ids)
+        args.extend(pel_ids)
+    stock_ids = src.get("stock_ids") or []
+    if stock_ids:
+        placeholders = ", ".join("?" for _ in stock_ids)
+        entity_clauses.append(
+            f"(entity_type = 'stock' AND entity_id IN ({placeholders}))"
+        )
+        args.extend(stock_ids)
+    if entity_clauses:
+        clauses.append("(" + " OR ".join(entity_clauses) + ")")
+    actor_ids = src.get("actor_ids") or []
+    if actor_ids:
+        placeholders = ", ".join("?" for _ in actor_ids)
+        clauses.append(f"actor_id IN ({placeholders})")
+        args.extend(actor_ids)
+    actions = src.get("actions") or []
+    if actions:
+        placeholders = ", ".join("?" for _ in actions)
+        clauses.append(f"action IN ({placeholders})")
+        args.extend(actions)
+    time_from, time_to = resolve_activity_time(src)
+    if time_from:
+        clauses.append("created_at >= ?")
+        args.append(time_from)
+    if time_to:
+        clauses.append("created_at <= ?")
+        args.append(time_to)
+    if not clauses:
+        return "", args
+    return "WHERE " + " AND ".join(clauses), args
+
+
+def count_activity(filters: dict | None = None) -> int:
+    where, args = _activity_where(filters)
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            f"SELECT COUNT(*) AS n FROM activity {where}",
+            args,
+        ).fetchone()
+        connection.close()
+    return int(row["n"]) if row else 0
+
+
+def list_activity(
+    *,
+    offset: int = 0,
+    limit: int = ACTIVITY_PAGE_SIZE,
+    filters: dict | None = None,
+) -> list[dict]:
+    if offset < 0:
+        offset = 0
+    if limit < 1:
+        limit = ACTIVITY_PAGE_SIZE
+    where, args = _activity_where(filters)
+    with _lock:
+        connection = _connect()
+        rows = connection.execute(
+            f"""
+            SELECT * FROM activity
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*args, limit, offset],
+        ).fetchall()
+        connection.close()
+    items = []
+    for row in rows:
+        raw = row["payload"] if "payload" in row.keys() else "{}"
+        try:
+            payload = json.loads(raw or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        items.append(
+            {
+                "id": row["id"],
+                "created_at": str(row["created_at"] or ""),
+                "actor_id": (
+                    None if row["actor_id"] is None else int(row["actor_id"])
+                ),
+                "actor_name": str(row["actor_name"] or ""),
+                "entity_type": str(row["entity_type"] or ""),
+                "entity_id": int(row["entity_id"]),
+                "action": str(row["action"] or ""),
+                "payload": payload,
+            }
+        )
+    return items
 
 
 def worst_check_result(results: list[str]) -> str:
@@ -1437,6 +1932,17 @@ def update_error(
 def delete_error(error_id: int) -> bool:
     with _lock:
         connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM errors WHERE id = ?",
+            (error_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return False
+        keys = set(row.keys())
+        if "is_deleted" in keys and int(row["is_deleted"] or 0):
+            connection.close()
+            return False
         columns = _columns(connection, "errors")
         if "is_deleted" in columns:
             cursor = connection.execute(
@@ -1452,8 +1958,27 @@ def delete_error(error_id: int) -> bool:
                 "DELETE FROM errors WHERE id = ?",
                 (error_id,),
             )
-        connection.commit()
         deleted = cursor.rowcount > 0
+        if deleted:
+            payload = {
+                "pelengator_id": int(row["pelengator_id"]),
+                "kind": str(row["kind"] or ""),
+                "description": str(row["description"] or ""),
+            }
+            if "hw_class" in keys:
+                payload["hw_class"] = str(row["hw_class"] or "")
+            if "hw_part" in keys:
+                payload["hw_part"] = str(row["hw_part"] or "")
+            if "priority" in keys:
+                payload["priority"] = str(row["priority"] or "")
+            _log_activity(
+                connection,
+                "error",
+                error_id,
+                "error.deleted",
+                payload,
+            )
+        connection.commit()
         connection.close()
     return deleted
 
@@ -1491,6 +2016,11 @@ def _user_from_row(row: sqlite3.Row) -> dict:
         "username": str(row["username"] or ""),
         "role": str(row["role"] or "worker"),
         "status": status,
+        "notify_activity": (
+            int(row["notify_activity"] or 0)
+            if "notify_activity" in keys
+            else 0
+        ),
     }
 
 
@@ -1670,6 +2200,39 @@ def set_user_status(telegram_id: int, status: str) -> bool:
     return updated
 
 
+def set_user_notify(telegram_id: int, enabled: bool) -> bool:
+    with _lock:
+        connection = _connect()
+        if "notify_activity" not in _columns(connection, "users"):
+            connection.close()
+            return False
+        cursor = connection.execute(
+            "UPDATE users SET notify_activity = ? WHERE telegram_id = ?",
+            (1 if enabled else 0, telegram_id),
+        )
+        connection.commit()
+        updated = cursor.rowcount > 0
+        connection.close()
+    return updated
+
+
+def list_activity_subscribers() -> list[int]:
+    with _lock:
+        connection = _connect()
+        if "notify_activity" not in _columns(connection, "users"):
+            connection.close()
+            return []
+        rows = connection.execute(
+            """
+            SELECT telegram_id FROM users
+            WHERE COALESCE(notify_activity, 0) = 1
+              AND (status = 'active' OR status IS NULL OR status = '')
+            """
+        ).fetchall()
+        connection.close()
+    return [int(row["telegram_id"]) for row in rows]
+
+
 MAX_STOCK_QTY = 1_000_000
 MAX_STOCK_NAME = 80
 
@@ -1814,8 +2377,8 @@ def add_stock_item(name: str) -> int | None:
             "INSERT INTO stock_items (name) VALUES (?)",
             (name,),
         )
-        connection.commit()
         item_id = cursor.lastrowid
+        connection.commit()
         connection.close()
     return item_id
 
@@ -1910,12 +2473,30 @@ def add_stock(item_id: int, location: str, qty: int) -> str | None:
         if error:
             connection.close()
             return error
+        _log_activity(
+            connection,
+            "stock",
+            item_id,
+            "stock.added",
+            {
+                "name": _stock_name_locked(connection, item_id),
+                "qty": qty,
+                "location": location,
+            },
+        )
         connection.commit()
         connection.close()
     return None
 
 
-def move_stock(item_id: int, from_location: str, to_location: str, qty: int) -> str | None:
+def move_stock(
+    item_id: int,
+    from_location: str,
+    to_location: str,
+    qty: int,
+    *,
+    returned: bool = False,
+) -> str | None:
     from_location = normalize_stock_text(from_location)
     to_location = normalize_stock_text(to_location)
     if not from_location or not to_location:
@@ -1941,6 +2522,18 @@ def move_stock(item_id: int, from_location: str, to_location: str, qty: int) -> 
         if error:
             connection.close()
             return error
+        _log_activity(
+            connection,
+            "stock",
+            item_id,
+            "stock.returned" if returned else "stock.moved",
+            {
+                "name": _stock_name_locked(connection, item_id),
+                "qty": qty,
+                "from": from_location,
+                "to": to_location,
+            },
+        )
         connection.commit()
         connection.close()
     return None
@@ -1965,6 +2558,17 @@ def remove_stock(item_id: int, location: str, qty: int) -> str | None:
         if error:
             connection.close()
             return error
+        _log_activity(
+            connection,
+            "stock",
+            item_id,
+            "stock.removed",
+            {
+                "name": _stock_name_locked(connection, item_id),
+                "qty": qty,
+                "location": location,
+            },
+        )
         connection.commit()
         connection.close()
     return None
@@ -1992,12 +2596,18 @@ def delete_stock_item(item_id: int) -> bool:
     with _lock:
         connection = _connect()
         row = connection.execute(
-            "SELECT id FROM stock_items WHERE id = ?",
+            "SELECT id, name FROM stock_items WHERE id = ?",
             (item_id,),
         ).fetchone()
         if row is None:
             connection.close()
             return False
+        name = str(row["name"] or "")
+        qty_row = connection.execute(
+            "SELECT COALESCE(SUM(qty), 0) AS n FROM stock_lots WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+        qty = int(qty_row["n"] if qty_row else 0)
         connection.execute(
             "DELETE FROM stock_lots WHERE item_id = ?",
             (item_id,),
@@ -2006,6 +2616,14 @@ def delete_stock_item(item_id: int) -> bool:
             "DELETE FROM stock_items WHERE id = ?",
             (item_id,),
         )
+        if qty > 0:
+            _log_activity(
+                connection,
+                "stock",
+                item_id,
+                "stock.deleted",
+                {"name": name, "qty": qty},
+            )
         connection.commit()
         connection.close()
     return True

@@ -35,7 +35,10 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
     STK_QTY,
     STK_LOC,
     STK_PHOTO,
-) = range(13)
+    LOGS_TIME_FROM,
+    LOGS_TIME_TO,
+    LOGS_PEL_FILTER,
+) = range(16)
 
 STOCK_ERROR_TEXT = {
     "not_enough": "Недостаточно на этом месте.",
@@ -55,9 +58,45 @@ TYPE_FIELD_PROMPTS = {
 
 
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+_application: Application | None = None
+
+
+async def _flush_activity_notices() -> None:
+    events = storage.drain_activity_events()
+    if not events or _application is None:
+        return
+    subscribers = storage.list_activity_subscribers()
+    if not subscribers:
+        return
+    bot = _application.bot
+    for event in events:
+        text = screens.activity_notify_text(event)
+        for telegram_id in subscribers:
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    link_preview_options=_NO_PREVIEW,
+                )
+            except (Forbidden, BadRequest, NetworkError, TimedOut):
+                continue
 
 
 async def render(
+    update: Update,
+    text: str,
+    markup,
+    *,
+    as_new: bool = False,
+) -> None:
+    try:
+        await _render_message(update, text, markup, as_new=as_new)
+    finally:
+        await _flush_activity_notices()
+
+
+async def _render_message(
     update: Update,
     text: str,
     markup,
@@ -105,6 +144,18 @@ async def render_screen(
 
 
 async def render_stock_card(
+    update: Update,
+    item_id: int,
+    *,
+    as_new: bool = False,
+) -> None:
+    try:
+        await _render_stock_card(update, item_id, as_new=as_new)
+    finally:
+        await _flush_activity_notices()
+
+
+async def _render_stock_card(
     update: Update,
     item_id: int,
     *,
@@ -375,6 +426,78 @@ def _booking_label(update: Update) -> str:
     return storage.booking_label(db_user, user.username)
 
 
+def _bind_actor(update: Update) -> None:
+    user = update.effective_user
+    if user is None:
+        storage.set_activity_actor(None, "")
+        return
+    db_user = storage.get_user(user.id)
+    if db_user is None:
+        storage.set_activity_actor(user.id, user.full_name or user.username or "")
+        return
+    storage.set_activity_actor(
+        user.id,
+        storage.booking_label(db_user, user.username),
+    )
+
+
+def _copy_log_filters(src) -> dict:
+    data = src if isinstance(src, dict) else {}
+    pel_ids: list[int] = []
+    for item in data.get("pel_ids") or []:
+        try:
+            pel_ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    stock_ids: list[int] = []
+    for item in data.get("stock_ids") or []:
+        try:
+            stock_ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    actor_ids: list[int] = []
+    for item in data.get("actor_ids") or []:
+        try:
+            actor_ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return {
+        "pel_ids": pel_ids,
+        "stock_ids": stock_ids,
+        "actor_ids": actor_ids,
+        "actions": [str(item) for item in (data.get("actions") or [])],
+        "time_preset": str(data.get("time_preset") or ""),
+        "time_from": str(data.get("time_from") or ""),
+        "time_to": str(data.get("time_to") or ""),
+    }
+
+
+def _logs_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    draft = context.user_data.get("logs_draft")
+    if not isinstance(draft, dict):
+        draft = _copy_log_filters(context.user_data.get("logs_filters"))
+        context.user_data["logs_draft"] = draft
+    return draft
+
+
+def _start_logs_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    draft = _copy_log_filters(context.user_data.get("logs_filters"))
+    context.user_data["logs_draft"] = draft
+    return draft
+
+
+async def _show_logs(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    offset: int = 0,
+) -> None:
+    filters = storage.normalize_activity_filters(
+        context.user_data.get("logs_filters") or {}
+    )
+    context.user_data["logs_filters"] = filters
+    await render(update, *screens.logs_screen(offset, filters))
+
+
 def need_user(handler):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -391,6 +514,10 @@ def need_user(handler):
                 return USER_NAME
             return await user_reg_name(update, context)
         storage.update_user_username(user.id, user.username)
+        storage.set_activity_actor(
+            user.id,
+            storage.booking_label(db_user, user.username),
+        )
         status = db_user.get("status") or "active"
         if status != "active":
             screen = (
@@ -411,7 +538,10 @@ def need_user(handler):
                 return ConversationHandler.END
             await render(update, *screen, as_new=True)
             return ConversationHandler.END
-        return await handler(update, context)
+        try:
+            return await handler(update, context)
+        finally:
+            await _flush_activity_notices()
 
     wrapped.__name__ = handler.__name__
     return wrapped
@@ -535,6 +665,171 @@ async def on_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+def _toggle_list_value(values: list, value) -> list:
+    values = list(values)
+    if value in values:
+        values.remove(value)
+    else:
+        values.append(value)
+    return values
+
+
+async def on_logs_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    data = "" if query is None or not query.data else query.data
+    if not _is_admin(update):
+        await render(update, *screens.logs_denied_screen())
+        return ConversationHandler.END
+    if data == "nav:logs":
+        context.user_data.pop("logs_draft", None)
+        await _show_logs(update, context)
+        return ConversationHandler.END
+    if data.startswith("logs:p:"):
+        try:
+            offset = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            offset = 0
+        if offset < 0:
+            offset = 0
+        await _show_logs(update, context, offset)
+        return ConversationHandler.END
+    if data == "logs:add":
+        context.user_data.pop("logs_draft", None)
+        await render(update, *screens.logs_add_filter_screen())
+        return ConversationHandler.END
+    if data == "logs:clr":
+        context.user_data["logs_filters"] = {}
+        context.user_data.pop("logs_draft", None)
+        await _show_logs(update, context)
+        return ConversationHandler.END
+    if data.startswith("logs:rm:"):
+        kind = data.split(":")[2] if len(data.split(":")) > 2 else ""
+        filters = _copy_log_filters(context.user_data.get("logs_filters"))
+        if kind == "pels":
+            filters["pel_ids"] = []
+        elif kind == "stock":
+            filters["stock_ids"] = []
+        elif kind == "users":
+            filters["actor_ids"] = []
+        elif kind == "time":
+            filters["time_preset"] = ""
+            filters["time_from"] = ""
+            filters["time_to"] = ""
+        elif kind == "ops":
+            filters["actions"] = []
+        context.user_data["logs_filters"] = storage.normalize_activity_filters(filters)
+        await _show_logs(update, context)
+        return ConversationHandler.END
+    if data == "logs:fk:pels":
+        return await start_logs_pels_filter(update, context)
+    if data == "logs:pels":
+        await render(
+            update,
+            *screens.logs_pels_filter_screen(_logs_draft(context)),
+        )
+        return LOGS_PEL_FILTER
+    if data == "logs:fk:stock":
+        draft = _start_logs_draft(context)
+        context.user_data["logs_stock_page"] = 0
+        await render(update, *screens.logs_stock_filter_screen(draft, 0))
+        return ConversationHandler.END
+    if data == "logs:fk:users":
+        draft = _start_logs_draft(context)
+        await render(update, *screens.logs_users_filter_screen(draft))
+        return ConversationHandler.END
+    if data == "logs:fk:ops":
+        draft = _start_logs_draft(context)
+        await render(update, *screens.logs_ops_filter_screen(draft))
+        return ConversationHandler.END
+    if data == "logs:fk:time":
+        draft = _start_logs_draft(context)
+        await render(update, *screens.logs_time_filter_screen(draft))
+        return ConversationHandler.END
+    if data == "logs:time":
+        await render(update, *screens.logs_time_filter_screen(_logs_draft(context)))
+        return ConversationHandler.END
+    if data.startswith("logs:tp:"):
+        try:
+            pel_id = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            return LOGS_PEL_FILTER
+        draft = _logs_draft(context)
+        ids = list(draft.get("pel_ids") or [])
+        if pel_id in ids:
+            ids.remove(pel_id)
+        draft["pel_ids"] = ids
+        await render(update, *screens.logs_pels_filter_screen(draft))
+        return LOGS_PEL_FILTER
+    if data.startswith("logs:sp:"):
+        try:
+            page = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            page = 0
+        if page < 0:
+            page = 0
+        context.user_data["logs_stock_page"] = page
+        await render(
+            update,
+            *screens.logs_stock_filter_screen(_logs_draft(context), page),
+        )
+        return ConversationHandler.END
+    if data.startswith("logs:si:"):
+        try:
+            item_id = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            return ConversationHandler.END
+        draft = _logs_draft(context)
+        draft["stock_ids"] = _toggle_list_value(draft.get("stock_ids") or [], item_id)
+        page = int(context.user_data.get("logs_stock_page") or 0)
+        await render(update, *screens.logs_stock_filter_screen(draft, page))
+        return ConversationHandler.END
+    if data.startswith("logs:tu:"):
+        try:
+            user_id = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            return ConversationHandler.END
+        draft = _logs_draft(context)
+        draft["actor_ids"] = _toggle_list_value(draft.get("actor_ids") or [], user_id)
+        await render(update, *screens.logs_users_filter_screen(draft))
+        return ConversationHandler.END
+    if data.startswith("logs:to:"):
+        action = data[len("logs:to:") :]
+        if action not in storage.ACTIVITY_ACTION_KEYS:
+            return ConversationHandler.END
+        draft = _logs_draft(context)
+        draft["actions"] = _toggle_list_value(draft.get("actions") or [], action)
+        await render(update, *screens.logs_ops_filter_screen(draft))
+        return ConversationHandler.END
+    if data.startswith("logs:ts:"):
+        preset = data.split(":")[2] if len(data.split(":")) > 2 else ""
+        if preset not in storage.ACTIVITY_TIME_PRESETS or preset == "custom":
+            return ConversationHandler.END
+        draft = _logs_draft(context)
+        if draft.get("time_preset") == preset:
+            draft["time_preset"] = ""
+            draft["time_from"] = ""
+            draft["time_to"] = ""
+        else:
+            draft["time_preset"] = preset
+            draft["time_from"] = ""
+            draft["time_to"] = ""
+        await render(update, *screens.logs_time_filter_screen(draft))
+        return ConversationHandler.END
+    if data == "logs:tc":
+        return await start_logs_time(update, context)
+    if data == "logs:ok":
+        draft = _logs_draft(context)
+        context.user_data["logs_filters"] = storage.normalize_activity_filters(draft)
+        context.user_data.pop("logs_draft", None)
+        await _show_logs(update, context)
+        return ConversationHandler.END
+    await _show_logs(update, context)
+    return ConversationHandler.END
+
+
 @need_user
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
     query = update.callback_query
@@ -547,8 +842,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if data == "nav:profile":
         await render_screen(update, _profile(update))
         return ConversationHandler.END
+    if data == "nav:logs" or data.startswith("logs:"):
+        return await on_logs_callback(update, context)
     if data == "me:name":
         return await start_edit_own_name(update, context)
+    if data == "me:ntf":
+        user_id = _viewer_id(update)
+        db_user = None if user_id is None else storage.get_user(user_id)
+        if db_user is None:
+            await render(update, *screens.register_prompt())
+            return USER_NAME
+        enabled = not bool(db_user.get("notify_activity"))
+        storage.set_user_notify(user_id, enabled)
+        try:
+            await query.answer(
+                "Уведомления включены" if enabled else "Уведомления выключены"
+            )
+        except BadRequest:
+            pass
+        await render_screen(update, _profile(update))
+        return ConversationHandler.END
     if data == "nav:types":
         await render(update, *screens.types_screen())
         return ConversationHandler.END
@@ -1227,6 +1540,7 @@ async def stock_pick_from(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def stock_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _bind_actor(update)
     qty = storage.parse_stock_qty(update.message.text if update.message else None)
     item_id = context.user_data.get("stk_item_id")
     item = None if item_id is None else storage.get_stock_item(item_id)
@@ -1300,6 +1614,7 @@ async def stock_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             context.user_data.get("stk_from") or "",
             storage.DEFAULT_LOCATION,
             qty,
+            returned=True,
         )
         if error:
             await render(
@@ -1387,6 +1702,7 @@ async def start_stock_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def stock_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _bind_actor(update)
     item_id = context.user_data.get("stk_item_id")
     file_id = _message_photo_id(update.message)
     if item_id is None:
@@ -1578,6 +1894,7 @@ async def start_move_pelengator(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def pel_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _bind_actor(update)
     value = _non_empty(update.message.text if update.message else None)
     pelengator_id = context.user_data.get("edit_pel_id")
     field = context.user_data.get("edit_pel_field")
@@ -1618,6 +1935,7 @@ async def start_add_pelengator(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def pel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _bind_actor(update)
     raw = _non_empty(update.message.text if update.message else None)
     type_id = context.user_data.get("pelengator_type_id")
     if type_id is None:
@@ -1763,6 +2081,7 @@ async def start_error_description(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def err_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _bind_actor(update)
     description = _non_empty(update.message.text if update.message else None)
     pelengator_id = context.user_data.get("error_pelengator_id")
     kind = context.user_data.get("error_kind")
@@ -1870,6 +2189,133 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"Ошибка бота: {error}")
 
 
+@need_user
+async def start_logs_pels_filter(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not _is_admin(update):
+        await render(update, *screens.logs_denied_screen())
+        return ConversationHandler.END
+    draft = _start_logs_draft(context)
+    await render(update, *screens.logs_pels_filter_screen(draft))
+    return LOGS_PEL_FILTER
+
+
+async def logs_pel_filter_add(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not _is_admin(update):
+        await render(update, *screens.logs_denied_screen(), as_new=True)
+        return ConversationHandler.END
+    pel_id = storage.parse_pelengator_id(
+        _non_empty(update.message.text if update.message else None)
+    )
+    draft = _logs_draft(context)
+    if pel_id is None:
+        await render(
+            update,
+            *screens.logs_pels_filter_screen(
+                draft,
+                note="Нужен номер пеленгатора, например <code>23</code>.",
+            ),
+            as_new=True,
+        )
+        return LOGS_PEL_FILTER
+    ids = list(draft.get("pel_ids") or [])
+    if pel_id not in ids:
+        ids.append(pel_id)
+    draft["pel_ids"] = ids
+    await render(
+        update,
+        *screens.logs_pels_filter_screen(draft),
+        as_new=True,
+    )
+    return LOGS_PEL_FILTER
+
+
+@need_user
+async def start_logs_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _is_admin(update):
+        await render(update, *screens.logs_denied_screen())
+        return ConversationHandler.END
+    _logs_draft(context)
+    context.user_data["cancel_back"] = "logs:time"
+    await render(
+        update,
+        *_ask(
+            context,
+            "С какой даты?\n"
+            "Например <code>13.10.2026</code> или <code>13.10.2026 07:00</code>",
+        ),
+    )
+    return LOGS_TIME_FROM
+
+
+async def logs_time_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    parsed = storage.parse_log_datetime(
+        _non_empty(update.message.text if update.message else None)
+    )
+    if not parsed:
+        await render(
+            update,
+            *_ask(
+                context,
+                "Не понял дату. Введите как <code>13.10.2026</code> "
+                "или <code>13.10.2026 07:00</code>:",
+            ),
+            as_new=True,
+        )
+        return LOGS_TIME_FROM
+    context.user_data["logs_time_from"] = parsed
+    await render(
+        update,
+        *_ask(
+            context,
+            "По какую дату? (включительно)\n"
+            "Например <code>13.10.2026</code> или слово <code>сейчас</code>",
+        ),
+        as_new=True,
+    )
+    return LOGS_TIME_TO
+
+
+async def logs_time_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = _non_empty(update.message.text if update.message else None)
+    if raw.casefold() in {"сейчас", "now"}:
+        parsed = storage.now_iso()
+    else:
+        parsed = storage.parse_log_datetime(raw, end_of_day=True)
+    if not parsed:
+        await render(
+            update,
+            *_ask(
+                context,
+                "Не понял дату. Введите как <code>13.10.2026</code> "
+                "или слово <code>сейчас</code>:",
+            ),
+            as_new=True,
+        )
+        return LOGS_TIME_TO
+    started = str(context.user_data.get("logs_time_from") or "")
+    if not started:
+        return await start_logs_time(update, context)
+    if parsed < started:
+        started, parsed = parsed, started
+    draft = _logs_draft(context)
+    draft["time_preset"] = "custom"
+    draft["time_from"] = started
+    draft["time_to"] = parsed
+    context.user_data.pop("logs_time_from", None)
+    await render(
+        update,
+        *screens.logs_time_filter_screen(draft),
+        as_new=True,
+    )
+    return ConversationHandler.END
+
+
 def build_application() -> Application:
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     if TELEGRAM_PROXY:
@@ -1879,9 +2325,11 @@ def build_application() -> Application:
 
 
 def main() -> None:
+    global _application
     storage.init_db()
     print(f"База данных: {storage.DB_PATH}")
     app = build_application()
+    _application = app
 
     conversation = ConversationHandler(
         entry_points=[
@@ -1897,6 +2345,8 @@ def main() -> None:
             CallbackQueryHandler(start_edit_error, pattern=r"^err:e:"),
             CallbackQueryHandler(start_edit_own_name, pattern=r"^me:name$"),
             CallbackQueryHandler(on_stock_callback, pattern=r"^stk:"),
+            CallbackQueryHandler(start_logs_time, pattern=r"^logs:tc$"),
+            CallbackQueryHandler(start_logs_pels_filter, pattern=r"^logs:fk:pels$"),
         ],
         states={
             USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_reg_name)],
@@ -1922,6 +2372,15 @@ def main() -> None:
             STK_PHOTO: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, stock_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, stock_photo_wrong),
+            ],
+            LOGS_TIME_FROM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, logs_time_from)
+            ],
+            LOGS_TIME_TO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, logs_time_to)
+            ],
+            LOGS_PEL_FILTER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, logs_pel_filter_add)
             ],
         },
         fallbacks=[

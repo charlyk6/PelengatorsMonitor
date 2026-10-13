@@ -1120,10 +1120,390 @@ def profile_screen(user: dict) -> tuple[str, InlineKeyboardMarkup]:
     keyboard = _markup(
         [
             [_btn("Сменить имя", "me:name")],
+            [_btn("Логи", "nav:logs")],
+            [
+                _btn(
+                    "Выключить уведомления"
+                    if user.get("notify_activity")
+                    else "Включить уведомления",
+                    "me:ntf",
+                )
+            ],
             [_btn("← Меню", "nav:home")],
         ]
     )
     return text, keyboard
+
+
+def logs_denied_screen() -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "<b>Логи</b>\n\n"
+        "Для получения логов обратитесь к администратору."
+    )
+    keyboard = _markup([[_btn("← Профиль", "nav:profile")]])
+    return text, keyboard
+
+
+def _check_label(on: bool, text: str) -> str:
+    mark = "✅" if on else "☐"
+    return f"{mark} {text}"
+
+
+def _logs_filters(filters: dict | None) -> dict:
+    return storage.normalize_activity_filters(filters)
+
+
+def _logs_filter_summary(filters: dict | None) -> str:
+    src = _logs_filters(filters)
+    bits: list[str] = []
+    pel_ids = src.get("pel_ids") or []
+    if pel_ids:
+        shown = ", ".join(f"#{item_id}" for item_id in pel_ids[:8])
+        if len(pel_ids) > 8:
+            shown += "…"
+        bits.append(shown)
+    stock_ids = src.get("stock_ids") or []
+    if stock_ids:
+        names = []
+        for item_id in stock_ids[:6]:
+            item = storage.get_stock_item(item_id)
+            if item:
+                names.append(escape(str(item.get("name") or item_id)))
+            else:
+                names.append(f"#{item_id}")
+        shown = ", ".join(names)
+        if len(stock_ids) > 6:
+            shown += "…"
+        bits.append(shown)
+    actor_ids = src.get("actor_ids") or []
+    if actor_ids:
+        names = []
+        for uid in actor_ids:
+            user = storage.get_user(uid)
+            if user:
+                names.append(escape(user.get("name") or str(uid)))
+            else:
+                names.append(str(uid))
+        bits.append(", ".join(names))
+    range_label = storage.format_activity_range_label(src)
+    if range_label:
+        bits.append(escape(range_label))
+    actions = src.get("actions") or []
+    if actions:
+        labels = [
+            storage.ACTIVITY_ACTION_LABELS.get(key, key) for key in actions
+        ]
+        shown = ", ".join(labels[:4])
+        if len(labels) > 4:
+            shown += "…"
+        bits.append(escape(shown))
+    if not bits:
+        return ""
+    return "Фильтры: " + " · ".join(bits)
+
+
+def _activity_event_line(item: dict) -> str:
+    when = storage.format_check_time(item.get("created_at"))
+    actor = escape(item.get("actor_name") or "система")
+    action = item.get("action") or ""
+    payload = item.get("payload") or {}
+    entity_id = item.get("entity_id")
+    name = escape(str(payload.get("name") or ""))
+    qty = payload.get("qty")
+    loc = escape(str(payload.get("location") or ""))
+    src = escape(str(payload.get("from") or ""))
+    dst = escape(str(payload.get("to") or ""))
+    holder = escape(str(payload.get("holder_name") or ""))
+    duration = storage.format_hold_duration(payload.get("seconds"))
+    if action == "pel.created":
+        type_name = escape(str(payload.get("type_name") or ""))
+        extra = f" · {type_name}" if type_name else ""
+        detail = f"пеленгатор #{entity_id} создан{extra}"
+    elif action == "pel.moved":
+        detail = f"пеленгатор #{entity_id} · {src} → {dst}"
+    elif action == "pel.reserved":
+        extra = f" на {holder}" if holder else ""
+        detail = f"пеленгатор #{entity_id} забронирован{extra}"
+    elif action == "pel.released":
+        extra = f" · {duration}" if duration else ""
+        detail = f"пеленгатор #{entity_id} бронь снята{extra}"
+    elif action == "pel.type_changed":
+        detail = (
+            f"пеленгатор #{entity_id} шаблон "
+            f"{escape(str(payload.get('from_type_name') or '—'))} → "
+            f"{escape(str(payload.get('to_type_name') or '—'))}"
+        )
+    elif action == "pel.archived":
+        detail = f"пеленгатор #{entity_id} в архив"
+    elif action == "pel.restored":
+        detail = f"пеленгатор #{entity_id} из архива"
+    elif action == "pel.deleted":
+        type_name = escape(str(payload.get("type_name") or ""))
+        extra = f" · {type_name}" if type_name else ""
+        detail = f"пеленгатор #{entity_id} удалён{extra}"
+    elif action in ("error.created", "error.deleted"):
+        pel_id = payload.get("pelengator_id")
+        kind = "железо" if payload.get("kind") == "hardware" else "софт"
+        verb = "добавлена" if action == "error.created" else "удалена"
+        desc = escape(str(payload.get("description") or ""))
+        if len(desc) > 120:
+            desc = desc[:119] + "…"
+        extra = f" · {desc}" if desc else ""
+        detail = f"ошибка #{entity_id} {verb} · пеленгатор #{pel_id} · {kind}{extra}"
+    elif action == "stock.created":
+        detail = f"склад · карточка «{name}»"
+    elif action == "stock.added":
+        detail = f"склад · «{name}» +{qty} · {loc}"
+    elif action == "stock.moved":
+        detail = f"склад · «{name}» {qty} шт. · {src} → {dst}"
+    elif action == "stock.returned":
+        detail = f"склад · «{name}» возврат {qty} шт. · {src} → {dst}"
+    elif action == "stock.removed":
+        detail = f"склад · «{name}» −{qty} · {loc}"
+    elif action == "stock.photo_set":
+        detail = f"склад · «{name}» фото"
+    elif action == "stock.photo_cleared":
+        detail = f"склад · «{name}» фото убрано"
+    elif action == "stock.deleted":
+        detail = f"склад · «{name}» карточка удалена"
+    else:
+        detail = f"{escape(action)} · #{entity_id}"
+    return f"{escape(when)} · {actor}\n{detail}"
+
+
+def activity_notify_text(item: dict) -> str:
+    return "<b>Событие</b>\n" + _activity_event_line(item)
+
+
+def logs_screen(
+    offset: int = 0,
+    filters: dict | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    if offset < 0:
+        offset = 0
+    src = _logs_filters(filters)
+    total = storage.count_activity(src)
+    page = storage.ACTIVITY_PAGE_SIZE
+    if total and offset >= total:
+        offset = max(0, ((total - 1) // page) * page)
+    items = storage.list_activity(offset=offset, limit=page, filters=src)
+    summary = _logs_filter_summary(src)
+    lines = ["<b>Логи</b>"]
+    if summary:
+        lines.append(summary)
+    if not items:
+        lines.append("")
+        lines.append(
+            "Нет записей по фильтрам." if src else "Пока записей нет."
+        )
+    else:
+        shown_from = offset + 1
+        shown_to = offset + len(items)
+        lines[0] = f"<b>Логи</b> · {shown_from}–{shown_to} из {total}"
+        lines.append("")
+        for item in items:
+            lines.append(_activity_event_line(item))
+            lines.append("")
+    rows: list[list] = [[_btn("Добавить фильтр", "logs:add")]]
+    active = []
+    if src.get("pel_ids"):
+        active.append(_btn("Пеленгаторы ✕", "logs:rm:pels"))
+    if src.get("stock_ids"):
+        active.append(_btn("Склад ✕", "logs:rm:stock"))
+    if src.get("actor_ids"):
+        active.append(_btn("Пользователь ✕", "logs:rm:users"))
+    if active:
+        rows.append(active)
+    active = []
+    if src.get("time_preset") or src.get("time_from") or src.get("time_to"):
+        active.append(_btn("Период ✕", "logs:rm:time"))
+    if src.get("actions"):
+        active.append(_btn("Операции ✕", "logs:rm:ops"))
+    if active:
+        rows.append(active)
+    if src:
+        rows.append([_btn("Сбросить фильтры", "logs:clr")])
+    nav = []
+    if items and offset > 0:
+        nav.append(_btn("Новее", f"logs:p:{max(0, offset - page)}"))
+    if items and offset + len(items) < total:
+        nav.append(_btn("Старше", f"logs:p:{offset + page}"))
+    if nav:
+        rows.append(nav)
+    rows.append([_btn("← Профиль", "nav:profile")])
+    return "\n".join(lines).rstrip(), _markup(rows)
+
+
+def logs_add_filter_screen() -> tuple[str, InlineKeyboardMarkup]:
+    text = "<b>Фильтр логов</b>\n\nЧто добавить?"
+    keyboard = _markup(
+        [
+            [_btn("Пеленгаторы", "logs:fk:pels")],
+            [_btn("Склад", "logs:fk:stock")],
+            [_btn("Пользователь", "logs:fk:users")],
+            [_btn("Период", "logs:fk:time")],
+            [_btn("Операции", "logs:fk:ops")],
+            [_btn("← К логам", "nav:logs")],
+        ]
+    )
+    return text, keyboard
+
+
+def logs_pels_filter_screen(
+    draft: dict | None = None,
+    note: str = "",
+) -> tuple[str, InlineKeyboardMarkup]:
+    selected = list(_logs_filters(draft).get("pel_ids") or [])
+    text = (
+        "<b>Фильтр · пеленгаторы</b>\n\n"
+        "Напишите id в чат, чтобы добавить, затем «Применить»."
+    )
+    if selected:
+        shown = ", ".join(f"#{item_id}" for item_id in selected)
+        text += f"\n\nВыбраны: {escape(shown)}"
+    else:
+        text += "\n\nПока никто не выбран."
+    if note:
+        text += "\n\n" + note
+    rows = []
+    pair: list = []
+    for item_id in selected:
+        pair.append(_btn(f"✕ #{item_id}", f"logs:tp:{item_id}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([_btn("Применить", "logs:ok")])
+    rows.append([_btn("← Назад", "logs:add")])
+    return text, _markup(rows)
+
+
+def logs_stock_filter_screen(
+    draft: dict | None = None,
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    items = storage.list_stock_items()
+    selected = set(_logs_filters(draft).get("stock_ids") or [])
+    if page < 0:
+        page = 0
+    size = storage.ACTIVITY_FILTER_PAGE_SIZE
+    chunk = items[page * size : (page + 1) * size]
+    text = (
+        "<b>Фильтр · склад</b>\n\n"
+        "Отметьте товары и нажмите «Применить»."
+    )
+    if not items:
+        text += "\n\nТоваров пока нет."
+    rows = []
+    known_ids = {item["id"] for item in items}
+    extra_ids = [item_id for item_id in selected if item_id not in known_ids]
+    if page == 0:
+        for item_id in extra_ids:
+            rows.append(
+                [
+                    _btn(
+                        _check_label(True, f"#{item_id}"),
+                        f"logs:si:{item_id}",
+                    )
+                ]
+            )
+    for item in chunk:
+        label = str(item.get("name") or f"#{item['id']}")
+        rows.append(
+            [
+                _btn(
+                    _check_label(item["id"] in selected, _short(label, 56)),
+                    f"logs:si:{item['id']}",
+                )
+            ]
+        )
+    nav = []
+    if page > 0:
+        nav.append(_btn("‹", f"logs:sp:{page - 1}"))
+    if (page + 1) * size < len(items):
+        nav.append(_btn("›", f"logs:sp:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([_btn("Применить", "logs:ok")])
+    rows.append([_btn("← Назад", "logs:add")])
+    return text, _markup(rows)
+
+
+def logs_users_filter_screen(draft: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    users = storage.list_users()
+    selected = set(_logs_filters(draft).get("actor_ids") or [])
+    text = (
+        "<b>Фильтр · пользователь</b>\n\n"
+        "Отметьте нужных и нажмите «Применить»."
+    )
+    if not users:
+        text += "\n\nПользователей пока нет."
+    rows = []
+    for item in users:
+        nick = f" @{item['username']}" if item.get("username") else ""
+        label = f"{item.get('name') or item['telegram_id']}{nick}"
+        rows.append(
+            [
+                _btn(
+                    _check_label(
+                        item["telegram_id"] in selected,
+                        _short(label, 56),
+                    ),
+                    f"logs:tu:{item['telegram_id']}",
+                )
+            ]
+        )
+    rows.append([_btn("Применить", "logs:ok")])
+    rows.append([_btn("← Назад", "logs:add")])
+    return text, _markup(rows)
+
+
+def logs_ops_filter_screen(draft: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    selected = set(_logs_filters(draft).get("actions") or [])
+    text = (
+        "<b>Фильтр · операции</b>\n\n"
+        "Отметьте нужные и нажмите «Применить»."
+    )
+    rows = []
+    pair: list = []
+    for key, label in storage.ACTIVITY_ACTIONS:
+        pair.append(
+            _btn(_check_label(key in selected, label), f"logs:to:{key}")
+        )
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([_btn("Применить", "logs:ok")])
+    rows.append([_btn("← Назад", "logs:add")])
+    return text, _markup(rows)
+
+
+def logs_time_filter_screen(draft: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    src = _logs_filters(draft)
+    preset = str(src.get("time_preset") or "")
+    text = (
+        "<b>Фильтр · период</b>\n\n"
+        "Выберите промежуток и нажмите «Применить»."
+    )
+    custom_label = storage.format_activity_range_label(
+        {**src, "time_preset": "custom"}
+    )
+    rows = []
+    for key, label in storage.ACTIVITY_TIME_PRESETS.items():
+        if key == "custom":
+            continue
+        rows.append([_btn(_check_label(preset == key, label), f"logs:ts:{key}")])
+    if preset == "custom" and custom_label:
+        rows.append(
+            [_btn(_check_label(True, _short(custom_label, 56)), "logs:tc")]
+        )
+    rows.append([_btn("Свой период", "logs:tc")])
+    rows.append([_btn("Применить", "logs:ok")])
+    rows.append([_btn("← Назад", "logs:add")])
+    return text, _markup(rows)
 
 
 def register_prompt() -> tuple[str, None]:
