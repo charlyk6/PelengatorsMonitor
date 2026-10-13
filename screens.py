@@ -1,4 +1,4 @@
-from html import escape
+from html import escape, unescape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -1202,6 +1202,29 @@ def _logs_filter_summary(filters: dict | None) -> str:
     return "Фильтры: " + " · ".join(bits)
 
 
+def _logs_filter_button_rows(src: dict) -> list[list]:
+    rows: list[list] = [[_btn("Добавить фильтр", "logs:add")]]
+    active = []
+    if src.get("pel_ids"):
+        active.append(_btn("Пеленгаторы ✕", "logs:rm:pels"))
+    if src.get("stock_ids"):
+        active.append(_btn("Склад ✕", "logs:rm:stock"))
+    if src.get("actor_ids"):
+        active.append(_btn("Пользователь ✕", "logs:rm:users"))
+    if active:
+        rows.append(active)
+    active = []
+    if src.get("time_preset") or src.get("time_from") or src.get("time_to"):
+        active.append(_btn("Период ✕", "logs:rm:time"))
+    if src.get("actions"):
+        active.append(_btn("Операции ✕", "logs:rm:ops"))
+    if active:
+        rows.append(active)
+    if src:
+        rows.append([_btn("Сбросить фильтры", "logs:clr")])
+    return rows
+
+
 def _activity_event_line(item: dict) -> str:
     when = storage.format_check_time(item.get("created_at"))
     actor = escape(item.get("actor_name") or "система")
@@ -1304,25 +1327,7 @@ def logs_screen(
         for item in items:
             lines.append(_activity_event_line(item))
             lines.append("")
-    rows: list[list] = [[_btn("Добавить фильтр", "logs:add")]]
-    active = []
-    if src.get("pel_ids"):
-        active.append(_btn("Пеленгаторы ✕", "logs:rm:pels"))
-    if src.get("stock_ids"):
-        active.append(_btn("Склад ✕", "logs:rm:stock"))
-    if src.get("actor_ids"):
-        active.append(_btn("Пользователь ✕", "logs:rm:users"))
-    if active:
-        rows.append(active)
-    active = []
-    if src.get("time_preset") or src.get("time_from") or src.get("time_to"):
-        active.append(_btn("Период ✕", "logs:rm:time"))
-    if src.get("actions"):
-        active.append(_btn("Операции ✕", "logs:rm:ops"))
-    if active:
-        rows.append(active)
-    if src:
-        rows.append([_btn("Сбросить фильтры", "logs:clr")])
+    rows = _logs_filter_button_rows(src)
     nav = []
     if items and offset > 0:
         nav.append(_btn("Новее", f"logs:p:{max(0, offset - page)}"))
@@ -1332,6 +1337,99 @@ def logs_screen(
         rows.append(nav)
     rows.append([_btn("← Профиль", "nav:profile")])
     return "\n".join(lines).rstrip(), _markup(rows)
+
+
+def logs_request_screen(filters: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    src = _logs_filters(filters)
+    summary = _logs_filter_summary(src)
+    text = (
+        "<b>Запрос логов</b>\n\n"
+        "Соберите фильтры и отправьте запрос администратору.\n"
+        "История придёт после подтверждения."
+    )
+    if summary:
+        text += f"\n\n{summary}"
+    else:
+        text += "\n\nФильтры пока не заданы — уйдёт вся история."
+    rows = _logs_filter_button_rows(src)
+    rows.append([_btn("Запросить историю", "logs:ask")])
+    rows.append([_btn("← Профиль", "nav:profile")])
+    return text, _markup(rows)
+
+
+def logs_request_sent_screen(*, no_admins: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    if no_admins:
+        text = (
+            "<b>Запрос логов</b>\n\n"
+            "Сейчас нет доступных администраторов. Попробуйте позже.\n"
+            "Запрос сохранён и будет ждать подтверждения."
+        )
+    else:
+        text = (
+            "<b>Запрос отправлен</b>\n\n"
+            "Администратор получит его и после подтверждения пришлёт историю."
+        )
+    return text, _markup([[_btn("← Профиль", "nav:profile")]])
+
+
+def log_request_admin_text(request: dict) -> str:
+    name = escape(request.get("requester_name") or "пользователь")
+    summary = _logs_filter_summary(request.get("filters"))
+    total = storage.count_activity(request.get("filters"))
+    lines = [
+        "<b>Запрос логов</b>",
+        "",
+        f"{name} просит историю.",
+        summary if summary else "Фильтры: не заданы (вся история)",
+        f"Записей: <b>{total}</b>",
+        "",
+        "<i>Выдать историю или отказать.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def log_request_done_screen(
+    *,
+    approved: bool = False,
+    already: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
+    if already:
+        text = "Этот запрос уже обработан."
+    elif approved:
+        text = "История выдана пользователю."
+    else:
+        text = "Запрос отклонён."
+    return text, _markup([])
+
+
+def log_request_admin_markup(request_id: int) -> InlineKeyboardMarkup:
+    return _markup(
+        [
+            [
+                _btn("Выдать", f"logs:ya:{request_id}"),
+                _btn("Отказать", f"logs:na:{request_id}"),
+            ]
+        ]
+    )
+
+
+def activity_event_plain(item: dict) -> str:
+    return unescape(_activity_event_line(item))
+
+
+def logs_history_file_text(filters: dict | None, items: list[dict], total: int) -> str:
+    src = _logs_filters(filters)
+    summary = unescape(_logs_filter_summary(src) or "Фильтры: не заданы")
+    lines = ["История", summary, f"Записей: {total}", ""]
+    if not items:
+        lines.append("Записей нет.")
+        return "\n".join(lines)
+    for item in items:
+        lines.append(activity_event_plain(item))
+        lines.append("")
+    if total > len(items):
+        lines.append(f"Показаны первые {len(items)} из {total}.")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def logs_add_filter_screen() -> tuple[str, InlineKeyboardMarkup]:

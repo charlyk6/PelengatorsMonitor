@@ -1,8 +1,9 @@
 from html import escape
+from io import BytesIO
 import os
 import time
 
-from telegram import InputMediaPhoto, LinkPreviewOptions, Update
+from telegram import InputFile, InputMediaPhoto, LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.ext import (
@@ -495,7 +496,164 @@ async def _show_logs(
         context.user_data.get("logs_filters") or {}
     )
     context.user_data["logs_filters"] = filters
-    await render(update, *screens.logs_screen(offset, filters))
+    if _is_admin(update):
+        await render(update, *screens.logs_screen(offset, filters))
+        return
+    await render(update, *screens.logs_request_screen(filters))
+
+
+async def notify_admins_log_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    request: dict,
+    *,
+    except_id: int | None = None,
+) -> int:
+    text = screens.log_request_admin_text(request)
+    markup = screens.log_request_admin_markup(request["id"])
+    sent = 0
+    for admin in storage.list_admins():
+        if except_id is not None and admin["telegram_id"] == except_id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=admin["telegram_id"],
+                text=text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=_NO_PREVIEW,
+            )
+            sent += 1
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            continue
+    return sent
+
+
+async def _deliver_log_history(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    filters: dict | None,
+) -> None:
+    src = storage.normalize_activity_filters(filters)
+    total = storage.count_activity(src)
+    items = storage.list_activity(
+        offset=0,
+        limit=storage.LOG_EXPORT_LIMIT,
+        filters=src,
+    )
+    summary = screens._logs_filter_summary(src)
+    header = "<b>История</b>"
+    if summary:
+        header += "\n" + summary
+    if not items:
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=header + "\n\nЗаписей нет.",
+                parse_mode=ParseMode.HTML,
+                link_preview_options=_NO_PREVIEW,
+            )
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            return
+        return
+    file_text = screens.logs_history_file_text(src, items, total)
+    use_file = total > 25 or len(file_text) > 3500
+    if use_file:
+        payload = BytesIO(file_text.encode("utf-8"))
+        try:
+            await context.bot.send_document(
+                chat_id=telegram_id,
+                document=InputFile(payload, filename="history.txt"),
+                caption="История по запросу",
+            )
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            return
+        return
+    chunks: list[str] = []
+    current = header + "\n"
+    for item in items:
+        block = "\n" + screens._activity_event_line(item) + "\n"
+        if len(current) + len(block) > 3500 and current != header + "\n":
+            chunks.append(current.rstrip())
+            current = block.lstrip("\n")
+        else:
+            current += block
+    if current.strip():
+        chunks.append(current.rstrip())
+    for chunk in chunks:
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=chunk,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=_NO_PREVIEW,
+            )
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            return
+
+
+async def submit_log_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    user_id = _viewer_id(update)
+    if user_id is None:
+        return ConversationHandler.END
+    filters = storage.normalize_activity_filters(
+        context.user_data.get("logs_filters") or {}
+    )
+    request = storage.create_log_request(user_id, _booking_label(update), filters)
+    sent = await notify_admins_log_request(context, request, except_id=user_id)
+    await render(update, *screens.logs_request_sent_screen(no_admins=not sent))
+    return ConversationHandler.END
+
+
+async def decide_log_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    approved: bool,
+) -> int:
+    query = update.callback_query
+    data = "" if query is None or not query.data else query.data
+    try:
+        request_id = int(data.split(":")[2])
+    except (IndexError, ValueError):
+        return ConversationHandler.END
+    status = "approved" if approved else "denied"
+    request = storage.set_log_request_status(request_id, status)
+    if request is None:
+        if query is not None:
+            try:
+                await query.answer("Запрос уже обработан", show_alert=True)
+            except BadRequest:
+                pass
+        await render(update, *screens.log_request_done_screen(already=True))
+        return ConversationHandler.END
+    if approved:
+        if query is not None:
+            try:
+                await query.answer("История выдана")
+            except BadRequest:
+                pass
+        await render(update, *screens.log_request_done_screen(approved=True))
+        await _deliver_log_history(
+            context,
+            request["requester_id"],
+            request["filters"],
+        )
+    else:
+        if query is not None:
+            try:
+                await query.answer("Запрос отклонён")
+            except BadRequest:
+                pass
+        await render(update, *screens.log_request_done_screen(approved=False))
+        await _notify_user(
+            context,
+            request["requester_id"],
+            "Администратор отклонил запрос логов.",
+        )
+    return ConversationHandler.END
 
 
 def need_user(handler):
@@ -680,8 +838,19 @@ async def on_logs_callback(
 ) -> int:
     query = update.callback_query
     data = "" if query is None or not query.data else query.data
-    if not _is_admin(update):
-        await render(update, *screens.logs_denied_screen())
+    admin = _is_admin(update)
+    if (
+        data.startswith("logs:p:")
+        or data.startswith("logs:ya:")
+        or data.startswith("logs:na:")
+    ) and not admin:
+        if query is not None:
+            try:
+                await query.answer("Недостаточно прав", show_alert=True)
+            except BadRequest:
+                pass
+        else:
+            await _show_logs(update, context)
         return ConversationHandler.END
     if data == "nav:logs":
         context.user_data.pop("logs_draft", None)
@@ -820,6 +989,15 @@ async def on_logs_callback(
         return ConversationHandler.END
     if data == "logs:tc":
         return await start_logs_time(update, context)
+    if data == "logs:ask":
+        if admin:
+            await _show_logs(update, context)
+            return ConversationHandler.END
+        return await submit_log_request(update, context)
+    if data.startswith("logs:ya:"):
+        return await decide_log_request(update, context, approved=True)
+    if data.startswith("logs:na:"):
+        return await decide_log_request(update, context, approved=False)
     if data == "logs:ok":
         draft = _logs_draft(context)
         context.user_data["logs_filters"] = storage.normalize_activity_filters(draft)
@@ -2194,9 +2372,6 @@ async def start_logs_pels_filter(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    if not _is_admin(update):
-        await render(update, *screens.logs_denied_screen())
-        return ConversationHandler.END
     draft = _start_logs_draft(context)
     await render(update, *screens.logs_pels_filter_screen(draft))
     return LOGS_PEL_FILTER
@@ -2206,9 +2381,6 @@ async def logs_pel_filter_add(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    if not _is_admin(update):
-        await render(update, *screens.logs_denied_screen(), as_new=True)
-        return ConversationHandler.END
     pel_id = storage.parse_pelengator_id(
         _non_empty(update.message.text if update.message else None)
     )
@@ -2237,9 +2409,6 @@ async def logs_pel_filter_add(
 
 @need_user
 async def start_logs_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
-        await render(update, *screens.logs_denied_screen())
-        return ConversationHandler.END
     _logs_draft(context)
     context.user_data["cancel_back"] = "logs:time"
     await render(
@@ -2399,7 +2568,15 @@ def main() -> None:
     app.add_error_handler(on_error)
 
     print("Бот запущен!")
-    app.run_polling()
+    if not TELEGRAM_PROXY:
+        print("Если нет связи с Telegram — включите VPN или задайте TELEGRAM_PROXY.")
+    try:
+        app.run_polling(bootstrap_retries=-1)
+    except (TimedOut, NetworkError) as error:
+        print(
+            "Нет связи с Telegram API. Включите VPN или укажите TELEGRAM_PROXY "
+            f"в окружении. ({error})"
+        )
 
 
 if __name__ == "__main__":

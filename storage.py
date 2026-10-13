@@ -245,6 +245,7 @@ def _ensure_column(
 
 ACTIVITY_PAGE_SIZE = 12
 ACTIVITY_FILTER_PAGE_SIZE = 10
+LOG_EXPORT_LIMIT = 2000
 
 ACTIVITY_ACTIONS = [
     ("pel.created", "Пеленгатор создан"),
@@ -405,6 +406,15 @@ def init_db() -> None:
                 entity_id INTEGER NOT NULL,
                 action TEXT NOT NULL,
                 payload TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS log_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                requester_id INTEGER NOT NULL,
+                requester_name TEXT NOT NULL DEFAULT '',
+                filters TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending'
             );
             """
         )
@@ -2231,6 +2241,101 @@ def list_activity_subscribers() -> list[int]:
         ).fetchall()
         connection.close()
     return [int(row["telegram_id"]) for row in rows]
+
+
+def _log_request_from_row(row: sqlite3.Row) -> dict:
+    raw = row["filters"] if "filters" in row.keys() else "{}"
+    try:
+        filters = json.loads(raw or "{}")
+    except (TypeError, json.JSONDecodeError):
+        filters = {}
+    if not isinstance(filters, dict):
+        filters = {}
+    return {
+        "id": int(row["id"]),
+        "created_at": str(row["created_at"] or ""),
+        "requester_id": int(row["requester_id"]),
+        "requester_name": str(row["requester_name"] or ""),
+        "filters": normalize_activity_filters(filters),
+        "status": str(row["status"] or "pending"),
+    }
+
+
+def create_log_request(
+    requester_id: int,
+    requester_name: str,
+    filters: dict | None,
+) -> dict:
+    payload = json.dumps(normalize_activity_filters(filters), ensure_ascii=False)
+    with _lock:
+        connection = _connect()
+        connection.execute(
+            """
+            UPDATE log_requests
+            SET status = 'cancelled'
+            WHERE requester_id = ? AND status = 'pending'
+            """,
+            (requester_id,),
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO log_requests (
+                created_at, requester_id, requester_name, filters, status
+            ) VALUES (?, ?, ?, ?, 'pending')
+            """,
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                requester_id,
+                requester_name or "",
+                payload,
+            ),
+        )
+        request_id = int(cursor.lastrowid)
+        row = connection.execute(
+            "SELECT * FROM log_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.commit()
+        connection.close()
+    return _log_request_from_row(row)
+
+
+def get_log_request(request_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM log_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.close()
+    if row is None:
+        return None
+    return _log_request_from_row(row)
+
+
+def set_log_request_status(request_id: int, status: str) -> dict | None:
+    if status not in ("approved", "denied", "cancelled"):
+        return None
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM log_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None or str(row["status"] or "") != "pending":
+            connection.close()
+            return None
+        connection.execute(
+            "UPDATE log_requests SET status = ? WHERE id = ?",
+            (status, request_id),
+        )
+        connection.commit()
+        updated = connection.execute(
+            "SELECT * FROM log_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.close()
+    return None if updated is None else _log_request_from_row(updated)
 
 
 MAX_STOCK_QTY = 1_000_000
