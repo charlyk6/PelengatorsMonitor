@@ -2391,7 +2391,7 @@ async def start_edit_own_email(
         update,
         *_ask(
             context,
-            "Почта Яндекса, например <code>name@yandex.ru</code>.\n"
+            "Введите почту, например <code>name@mail.ru</code>.\n"
             f"Сейчас: <code>{escape(current)}</code>\n\n"
             "Чтобы убрать, напишите <code>удалить</code>.",
         ),
@@ -2400,7 +2400,7 @@ async def start_edit_own_email(
 
 
 async def user_edit_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    parsed = storage.parse_yandex_email(
+    parsed = storage.parse_email(
         update.message.text if update.message else None
     )
     user = update.effective_user
@@ -2409,7 +2409,7 @@ async def user_edit_email(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             update,
             *_ask(
                 context,
-                "Нужен адрес вида <code>name@yandex.ru</code>. "
+                "Нужен адрес вида <code>name@mail.ru</code>. "
                 "Либо напишите <code>удалить</code>.",
             ),
             as_new=True,

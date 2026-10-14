@@ -2475,14 +2475,14 @@ def set_user_notify(telegram_id: int, enabled: bool) -> bool:
     return updated
 
 
-def parse_yandex_email(raw: str | None) -> str | None:
+def parse_email(raw: str | None) -> str | None:
     text = (raw or "").strip().casefold()
     if text in {"-", "нет", "удалить", "убрать"}:
         return ""
-    if not text.endswith("@yandex.ru"):
+    if text.count("@") != 1 or any(ch.isspace() for ch in text):
         return None
-    local = text[: -len("@yandex.ru")]
-    if not local or any(ch.isspace() for ch in local):
+    local, domain = text.split("@", 1)
+    if not local or not domain or "." not in domain or domain.startswith(".") or domain.endswith("."):
         return None
     return text
 
