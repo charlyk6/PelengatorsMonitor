@@ -38,10 +38,11 @@ def _open_smtp() -> smtplib.SMTP:
     attempts: list[tuple[str, int]] = []
     seen: set[tuple[str, int]] = set()
     for mode, port in (
-        ("starttls", MAIL_SMTP_PORT),
-        ("starttls", 2525),
         ("starttls", 587),
         ("ssl", 465),
+        ("starttls", 2525),
+        ("starttls", MAIL_SMTP_PORT),
+        ("ssl", MAIL_SMTP_PORT),
     ):
         key = (mode, port)
         if key in seen:
@@ -52,9 +53,9 @@ def _open_smtp() -> smtplib.SMTP:
     for mode, port in attempts:
         try:
             if mode == "ssl":
-                smtp = smtplib.SMTP_SSL(host, port, context=context, timeout=20)
+                smtp = smtplib.SMTP_SSL(host, port, context=context, timeout=8)
             else:
-                smtp = smtplib.SMTP(host, port, timeout=20)
+                smtp = smtplib.SMTP(host, port, timeout=8)
                 smtp.ehlo()
                 smtp.starttls(context=context)
                 smtp.ehlo()

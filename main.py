@@ -965,11 +965,15 @@ async def notify_purchasers(
     recipients: dict[int, bool] = {}
     for user in storage.list_purchasers():
         recipients[int(user["telegram_id"])] = False
-    if not created:
+    if created:
+        for user in storage.list_admins():
+            recipients.setdefault(int(user["telegram_id"]), False)
+    else:
         recipients[int(item["created_by"])] = True
+    telegram_ids = dict(recipients)
     if except_id is not None:
-        recipients.pop(int(except_id), None)
-    for telegram_id, for_author in recipients.items():
+        telegram_ids.pop(int(except_id), None)
+    for telegram_id, for_author in telegram_ids.items():
         text = screens.request_notify_text(
             item,
             created=created,
@@ -985,14 +989,23 @@ async def notify_purchasers(
             )
         except (BadRequest, Forbidden, NetworkError, TimedOut):
             pass
-        user = storage.get_user(telegram_id)
-        if user and user.get("notify_email") and user.get("email"):
-            subject = (
-                f"Новая заявка #{item['id']}"
-                if created
-                else f"Статус заявки #{item['id']}"
-            )
-            await _send_email_notice(user["email"], subject, text)
+    subject = (
+        f"Новая заявка #{item['id']}"
+        if created
+        else f"Статус заявки #{item['id']}"
+    )
+    mailed: set[str] = set()
+    for user in storage.list_email_subscribers():
+        address = (user.get("email") or "").strip()
+        if not address or address in mailed:
+            continue
+        mailed.add(address)
+        text = screens.request_notify_text(
+            item,
+            created=created,
+            for_author=int(user["telegram_id"]) == int(item["created_by"]),
+        )
+        await _send_email_notice(address, subject, text)
 
 
 async def _show_check_step(update: Update, inspection: dict | None, pelengator_id: int | None = None) -> int:
