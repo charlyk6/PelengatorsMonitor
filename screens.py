@@ -139,6 +139,42 @@ def pel_id_link(bot_username: str | None, pelengator_id: int) -> str:
     )
 
 
+def buy_id_link(bot_username: str | None, purchase_id: int) -> str:
+    label = f"#{purchase_id}"
+    if not bot_username:
+        return f"<code>{label}</code>"
+    return (
+        f'<a href="https://t.me/{bot_username}?start=b{purchase_id}">'
+        f"{label}</a>"
+    )
+
+
+def req_id_link(bot_username: str | None, request_id: int) -> str:
+    label = f"#{request_id}"
+    if not bot_username:
+        return f"<code>{label}</code>"
+    return (
+        f'<a href="https://t.me/{bot_username}?start=r{request_id}">'
+        f"{label}</a>"
+    )
+
+
+def _user_tg(user: dict | None) -> str:
+    if user is None:
+        return "—"
+    nick = (user.get("username") or "").lstrip("@")
+    if nick:
+        return f"@{escape(nick)}"
+    return escape(user.get("name") or "—")
+
+
+def _day(iso: str | None) -> str:
+    shown = storage.format_check_time(iso)
+    if not shown or shown == "—":
+        return "—"
+    return shown.split(" ", 1)[0]
+
+
 def stock_name_link(bot_username: str | None, item_id: int, name: str) -> str:
     label = escape(name)
     if not bot_username:
@@ -168,8 +204,34 @@ def _short(text: str, limit: int = 36) -> str:
 # Главное меню
 # ──────────────────────────────────────────
 
-def home_screen(is_admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+def home_screen(
+    role: str = "worker",
+    *,
+    viewer_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
     stats = storage.counts()
+    if role == "purchaser":
+        text = (
+            "🛒 <b>Закупки</b>\n\n"
+            f"Закупки: <b>{stats['purchases']}</b>\n"
+            f"Архив: <b>{stats['archived_purchases']}</b>\n"
+            f"Заявки: <b>{stats['requests_open']}</b> открытых · <b>{stats['requests']}</b> всего\n"
+            f"Склад: <b>{stats['stock_items']}</b> наим. · <b>{stats['stock_qty']}</b> шт."
+        )
+        rows = [
+            [
+                _btn("Закупки", "nav:buys"),
+                _btn("Заявки", "nav:reqs"),
+            ],
+            [
+                _btn("📦 Архив", "nav:buyarch"),
+                _btn("🔧 Склад", "nav:stock"),
+            ],
+            [_btn("Профиль", "nav:profile")],
+        ]
+        return text, _markup(rows)
+
+    mine = storage.count_purchase_requests(created_by=viewer_id or 0)
     text = (
         "📡 <b>Мониторинг пеленгаторов</b>\n\n"
         f"Шаблоны: <b>{stats['types']}</b>\n"
@@ -177,7 +239,8 @@ def home_screen(is_admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
         f"Архив: <b>{stats['archived']}</b>\n"
         f"Склад: <b>{stats['stock_items']}</b> наим. · <b>{stats['stock_qty']}</b> шт.\n"
         f"Ошибки: <b>{stats['errors']}</b>"
-        f"  <i>(🔩 {stats['hardware']} · 💾 {stats['soft']})</i>"
+        f"  <i>(🔩 {stats['hardware']} · 💾 {stats['soft']})</i>\n"
+        f"Мои заявки: <b>{mine['open']}</b> открытых · <b>{mine['total']}</b> всего"
     )
     rows = [
         [
@@ -192,8 +255,12 @@ def home_screen(is_admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
             _btn("🔧 Склад", "nav:stock"),
             _btn("Профиль", "nav:profile"),
         ],
+        [
+            _btn("＋ Заявка", "req:add"),
+            _btn("Мои заявки", "nav:reqs"),
+        ],
     ]
-    if is_admin:
+    if role in ("owner", "admin"):
         rows.append([_btn("Пользователи", "nav:users")])
     return text, _markup(rows)
 
@@ -503,6 +570,260 @@ def stock_lot_pick_screen(
     ]
     rows.append([_btn("Отмена", back)])
     return title, _markup(rows)
+
+
+def _purchase_list_line(item: dict, bot_username: str | None) -> list[str]:
+    return [
+        f"{buy_id_link(bot_username, item['id'])} · {escape(item['name'])}",
+        f"    {_day(item.get('created_at'))}",
+    ]
+
+
+def purchases_screen(
+    bot_username: str | None = None,
+    *,
+    archived: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
+    items = storage.list_purchases(archived=archived)
+    title = "Архив закупок" if archived else "Закупки"
+    if items:
+        lines = [f"<b>{title}</b>", ""]
+        for item in items:
+            lines.extend(_purchase_list_line(item, bot_username))
+        lines.append("")
+        lines.append("<i>Нажмите номер или введите его, чтобы открыть карточку.</i>")
+        text = "\n".join(lines)
+    elif archived:
+        text = f"<b>{title}</b>\nАрхив пуст."
+    else:
+        text = f"<b>{title}</b>\nПока пусто — добавьте первую закупку."
+    rows = []
+    if not archived:
+        rows.append([_btn("＋ Новая закупка", "buy:add")])
+    rows.append([_btn("← Меню", "nav:home")])
+    return text, _markup(rows)
+
+
+def purchase_card(
+    purchase_id: int,
+    bot_username: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    item = storage.get_purchase(purchase_id)
+    if item is None:
+        return None
+    archived = bool(item.get("is_archived"))
+    lines = [
+        f"<b>Закупка {buy_id_link(bot_username, item['id'])}</b>",
+        f"<b>Наименование:</b> {escape(item['name'])}",
+        "",
+        "<b>Поставщик</b>",
+        f"<b>Название:</b> {escape(item['supplier_name']) or '—'}",
+        f"<b>Номер счёта:</b> {escape(item['invoice_number']) or '—'}",
+        f"<b>Дата:</b> {escape(item['invoice_date']) or '—'}",
+    ]
+    photos = item.get("photos") or []
+    if photos:
+        lines.append("")
+        lines.append(f"📷 <b>{len(photos)}</b> фото")
+    if archived:
+        lines.append("")
+        lines.append("📦 <b>В архиве</b>")
+    photo_row = []
+    if len(photos) < storage.MAX_PURCHASE_PHOTOS:
+        photo_row.append(_btn("📷 Добавить фото", f"buy:ph:{purchase_id}"))
+    if photos:
+        photo_row.append(_btn("Удалить все", f"buy:px:{purchase_id}"))
+    rows = [
+        [_btn("Наименование", f"buy:e:{purchase_id}:name")],
+        [_btn("Поставщик", f"buy:e:{purchase_id}:supplier_name")],
+        [
+            _btn("Номер счёта", f"buy:e:{purchase_id}:invoice_number"),
+            _btn("Дата", f"buy:e:{purchase_id}:invoice_date"),
+        ],
+    ]
+    if photo_row:
+        rows.append(photo_row)
+    if len(photos) > 1:
+        rows.append([_btn("Показать все", f"buy:ps:{purchase_id}")])
+    keyboard = _markup(
+        rows + [
+            [
+                _btn(
+                    "📤 Из архива" if archived else "📦 В архив",
+                    f"buy:ar:{purchase_id}",
+                )
+            ],
+            [
+                _btn(
+                    "← К архиву" if archived else "← К закупкам",
+                    "nav:buyarch" if archived else "nav:buys",
+                )
+            ],
+        ]
+    )
+    return "\n".join(lines), keyboard
+
+
+def purchase_photo_prompt(
+    purchase_id: int,
+    name: str,
+    *,
+    count: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        f"Пришлите фото для закупки «{escape(name)}».\n"
+        f"Сейчас: <b>{count}</b> из <b>{storage.MAX_PURCHASE_PHOTOS}</b>.\n\n"
+        "<i>Можно отправить несколько подряд — каждое добавится</i>"
+    )
+    keyboard = _markup([[_btn("Готово", f"buy:v:{purchase_id}")]])
+    return text, keyboard
+
+
+def purchase_search_screen(
+    query: str,
+    matches: list[dict],
+    bot_username: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    current = [item for item in matches if not item.get("is_archived")]
+    archived = [item for item in matches if item.get("is_archived")]
+    lines = [f"<b>Закупки</b> · «{escape(query)}»"]
+    if current:
+        lines.append("")
+        lines.append("<b>Актуальные</b>")
+        for item in current:
+            lines.extend(_purchase_list_line(item, bot_username))
+    if archived:
+        lines.append("")
+        lines.append("<b>Архивные</b>")
+        for item in archived:
+            lines.extend(_purchase_list_line(item, bot_username))
+    lines.append("")
+    lines.append("<i>Нажмите номер, чтобы открыть карточку.</i>")
+    return "\n".join(lines), None
+
+
+def purchase_wizard_photo() -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "<b>Новая закупка</b>\n\n"
+        "Пришлите фото счёта или товара.\n\n"
+        "<i>Можно пропустить</i>"
+    )
+    keyboard = _markup(
+        [
+            [_btn("Без фото", "buy:noph")],
+            [_btn("Отмена", "nav:buys")],
+        ]
+    )
+    return text, keyboard
+
+
+def requests_screen(
+    *,
+    viewer_id: int,
+    as_purchaser: bool,
+    bot_username: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    items = storage.list_purchase_requests(
+        created_by=None if as_purchaser else viewer_id
+    )
+    title = "Заявки" if as_purchaser else "Мои заявки"
+    if items:
+        lines = [f"<b>{title}</b>", ""]
+        for item in items:
+            author = storage.get_user(item["created_by"])
+            status = storage.REQUEST_STATUS_LABELS.get(
+                item["status"], item["status"]
+            )
+            lines.append(
+                f"{req_id_link(bot_username, item['id'])} · "
+                f"{escape(_short(item['description'], 48))}"
+            )
+            lines.append(
+                f"    {escape(status)} · {_user_tg(author)} · "
+                f"{_day(item.get('created_at'))}"
+            )
+        lines.append("")
+        lines.append("<i>Нажмите номер, чтобы открыть карточку.</i>")
+        text = "\n".join(lines)
+    else:
+        text = f"<b>{title}</b>\nПока заявок нет."
+    rows = []
+    if not as_purchaser:
+        rows.append([_btn("＋ Новая заявка", "req:add")])
+    rows.append([_btn("← Меню", "nav:home")])
+    return text, _markup(rows)
+
+
+def request_card(
+    request_id: int,
+    *,
+    as_purchaser: bool,
+    viewer_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    item = storage.get_purchase_request(request_id)
+    if item is None:
+        return None
+    if not as_purchaser and viewer_id is not None and item["created_by"] != viewer_id:
+        return None
+    author = storage.get_user(item["created_by"])
+    status = storage.REQUEST_STATUS_LABELS.get(item["status"], item["status"])
+    lines = [
+        f"<b>Заявка {req_id_link(None, item['id'])}</b>",
+        f"<b>Название:</b> {escape(item['description'])}",
+        f"<b>Заявитель:</b> {_user_tg(author)}",
+        f"<b>Дата:</b> {_day(item.get('created_at'))}",
+        f"<b>Статус:</b> {escape(status)}",
+    ]
+    rows: list[list] = []
+    if as_purchaser:
+        status_row = []
+        for key, label in (
+            ("new", "Новая"),
+            ("in_progress", "В работу"),
+            ("closed", "Закрыть"),
+        ):
+            if key == item["status"]:
+                continue
+            code = storage.REQUEST_STATUS_TO_CODE.get(key)
+            if not code:
+                continue
+            status_row.append(_btn(label, f"req:st:{request_id}:{code}"))
+        if status_row:
+            rows.append(status_row)
+    rows.append([_btn("← К заявкам", "nav:reqs")])
+    return "\n".join(lines), _markup(rows)
+
+
+def request_notify_markup(request_id: int) -> InlineKeyboardMarkup:
+    return _markup([[_btn("Открыть", f"req:v:{request_id}")]])
+
+
+def request_notify_text(
+    item: dict,
+    *,
+    created: bool = False,
+    for_author: bool = False,
+) -> str:
+    author = storage.get_user(item["created_by"])
+    author_name = escape(author["name"]) if author else "—"
+    status = storage.REQUEST_STATUS_LABELS.get(item["status"], item["status"])
+    if created:
+        title = "Новая заявка"
+    elif for_author:
+        title = "Статус вашей заявки"
+    else:
+        title = "Статус заявки"
+    desc = item["description"]
+    if len(desc) > 240:
+        desc = desc[:239] + "…"
+    lines = [
+        f"<b>{title} #{item['id']}</b>",
+        f"Статус: <b>{escape(status)}</b>",
+    ]
+    if not for_author:
+        lines.append(f"Автор: {author_name}")
+    lines.extend(["", escape(desc)])
+    return "\n".join(lines)
 
 
 def pelengator_card(
@@ -1041,19 +1362,23 @@ def cancel_keyboard(
     return _markup([row])
 
 
-def users_screen(viewer_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
+def users_screen(viewer: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
     users = storage.list_users()
+    viewer_id = None if viewer is None else viewer.get("telegram_id")
     if users:
         lines = ["<b>Пользователи</b>", ""]
         for item in users:
             nick = f" (@{item['username']})" if item.get("username") else ""
             status = item.get("status") or "active"
+            role = storage.ROLE_LABELS.get(item.get("role") or "worker", "Работник")
             extra = ""
             if status == "pending":
                 extra = " — ожидает"
             elif status == "blocked":
                 extra = " — заблокирован"
-            lines.append(f"{escape(item['name'])}{escape(nick)}{extra}")
+            lines.append(
+                f"{escape(item['name'])}{escape(nick)} · {escape(role)}{extra}"
+            )
         text = "\n".join(lines)
     else:
         text = "<b>Пользователи</b>\nПока никого нет."
@@ -1072,13 +1397,44 @@ def users_screen(viewer_id: int | None = None) -> tuple[str, InlineKeyboardMarku
         elif status == "blocked":
             row.append(_btn(f"Разблок. · {name}", f"usr:un:{uid}"))
         else:
-            if item.get("role") != "admin":
-                row.append(_btn(f"В админы · {name}", f"usr:adm:{uid}"))
+            can_role = any(
+                storage.can_assign_role(viewer, item, role)
+                for role in storage.ASSIGNABLE_ROLES
+            )
+            if can_role:
+                row.append(_btn(f"Роль · {name}", f"usr:role:{uid}"))
             if not is_self:
                 row.append(_btn("Заблок.", f"usr:bl:{uid}"))
         if row:
             rows.append(row)
     rows.append([_btn("← Меню", "nav:home")])
+    return text, _markup(rows)
+
+
+def user_role_screen(target: dict, actor: dict | None) -> tuple[str, InlineKeyboardMarkup]:
+    current = storage.ROLE_LABELS.get(target.get("role") or "worker", "Работник")
+    nick = f" (@{target['username']})" if target.get("username") else ""
+    text = (
+        f"<b>Роль</b>\n\n"
+        f"{escape(target['name'])}{escape(nick)}\n"
+        f"Сейчас: <b>{escape(current)}</b>"
+    )
+    rows = []
+    for role in storage.ASSIGNABLE_ROLES:
+        if not storage.can_assign_role(actor, target, role):
+            continue
+        mark = "✅ " if target.get("role") == role else ""
+        rows.append(
+            [
+                _btn(
+                    f"{mark}{storage.ROLE_LABELS[role]}",
+                    f"usr:set:{target['telegram_id']}:{role}",
+                )
+            ]
+        )
+    if not rows:
+        text += "\n\nЭту роль сменить нельзя."
+    rows.append([_btn("← К пользователям", "nav:users")])
     return text, _markup(rows)
 
 
@@ -1104,14 +1460,11 @@ def pick_user_for_booking(pelengator_id: int) -> tuple[str, InlineKeyboardMarkup
     return f"На кого забронировать пеленгатор <b>#{pelengator_id}</b>?", _markup(rows)
 
 
-ROLE_LABEL = {
-    "admin": "Администратор",
-    "worker": "Работник",
-}
+ROLE_LABEL = storage.ROLE_LABELS
 
 
 def profile_screen(user: dict) -> tuple[str, InlineKeyboardMarkup]:
-    role = ROLE_LABEL.get(user.get("role") or "worker", "Работник")
+    role = storage.ROLE_LABELS.get(user.get("role") or "worker", "Работник")
     text = (
         "<b>Профиль</b>\n\n"
         f"<b>Имя:</b> {escape(user.get('name') or '—')}\n"
@@ -1202,10 +1555,10 @@ def _logs_filter_summary(filters: dict | None) -> str:
     return "Фильтры: " + " · ".join(bits)
 
 
-def _logs_filter_button_rows(src: dict) -> list[list]:
+def _logs_filter_button_rows(src: dict, *, hide_pels: bool = False) -> list[list]:
     rows: list[list] = [[_btn("Добавить фильтр", "logs:add")]]
     active = []
-    if src.get("pel_ids"):
+    if src.get("pel_ids") and not hide_pels:
         active.append(_btn("Пеленгаторы ✕", "logs:rm:pels"))
     if src.get("stock_ids"):
         active.append(_btn("Склад ✕", "logs:rm:stock"))
@@ -1301,6 +1654,8 @@ def activity_notify_text(item: dict) -> str:
 def logs_screen(
     offset: int = 0,
     filters: dict | None = None,
+    *,
+    hide_pels: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     if offset < 0:
         offset = 0
@@ -1327,7 +1682,7 @@ def logs_screen(
         for item in items:
             lines.append(_activity_event_line(item))
             lines.append("")
-    rows = _logs_filter_button_rows(src)
+    rows = _logs_filter_button_rows(src, hide_pels=hide_pels)
     nav = []
     if items and offset > 0:
         nav.append(_btn("Новее", f"logs:p:{max(0, offset - page)}"))
@@ -1339,7 +1694,11 @@ def logs_screen(
     return "\n".join(lines).rstrip(), _markup(rows)
 
 
-def logs_request_screen(filters: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+def logs_request_screen(
+    filters: dict | None = None,
+    *,
+    hide_pels: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
     src = _logs_filters(filters)
     summary = _logs_filter_summary(src)
     text = (
@@ -1349,9 +1708,11 @@ def logs_request_screen(filters: dict | None = None) -> tuple[str, InlineKeyboar
     )
     if summary:
         text += f"\n\n{summary}"
+    elif hide_pels:
+        text += "\n\nФильтры пока не заданы — уйдёт история склада, без пеленгаторов."
     else:
         text += "\n\nФильтры пока не заданы — уйдёт вся история."
-    rows = _logs_filter_button_rows(src)
+    rows = _logs_filter_button_rows(src, hide_pels=hide_pels)
     rows.append([_btn("Запросить историю", "logs:ask")])
     rows.append([_btn("← Профиль", "nav:profile")])
     return text, _markup(rows)
@@ -1432,11 +1793,13 @@ def logs_history_file_text(filters: dict | None, items: list[dict], total: int) 
     return "\n".join(lines).rstrip() + "\n"
 
 
-def logs_add_filter_screen() -> tuple[str, InlineKeyboardMarkup]:
+def logs_add_filter_screen(*, hide_pels: bool = False) -> tuple[str, InlineKeyboardMarkup]:
     text = "<b>Фильтр логов</b>\n\nЧто добавить?"
-    keyboard = _markup(
+    rows = []
+    if not hide_pels:
+        rows.append([_btn("Пеленгаторы", "logs:fk:pels")])
+    rows.extend(
         [
-            [_btn("Пеленгаторы", "logs:fk:pels")],
             [_btn("Склад", "logs:fk:stock")],
             [_btn("Пользователь", "logs:fk:users")],
             [_btn("Период", "logs:fk:time")],
@@ -1444,7 +1807,7 @@ def logs_add_filter_screen() -> tuple[str, InlineKeyboardMarkup]:
             [_btn("← К логам", "nav:logs")],
         ]
     )
-    return text, keyboard
+    return text, _markup(rows)
 
 
 def logs_pels_filter_screen(
@@ -1557,7 +1920,11 @@ def logs_users_filter_screen(draft: dict | None = None) -> tuple[str, InlineKeyb
     return text, _markup(rows)
 
 
-def logs_ops_filter_screen(draft: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+def logs_ops_filter_screen(
+    draft: dict | None = None,
+    *,
+    hide_pels: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
     selected = set(_logs_filters(draft).get("actions") or [])
     text = (
         "<b>Фильтр · операции</b>\n\n"
@@ -1565,7 +1932,10 @@ def logs_ops_filter_screen(draft: dict | None = None) -> tuple[str, InlineKeyboa
     )
     rows = []
     pair: list = []
+    hidden = set(storage.PURCHASER_HIDDEN_ACTIONS) if hide_pels else set()
     for key, label in storage.ACTIVITY_ACTIONS:
+        if key in hidden:
+            continue
         pair.append(
             _btn(_check_label(key in selected, label), f"logs:to:{key}")
         )

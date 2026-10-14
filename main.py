@@ -39,7 +39,14 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
     LOGS_TIME_FROM,
     LOGS_TIME_TO,
     LOGS_PEL_FILTER,
-) = range(16)
+    BUY_PHOTO,
+    BUY_NAME,
+    BUY_SUPPLIER,
+    BUY_INVOICE,
+    BUY_DATE,
+    BUY_EDIT,
+    REQ_DESC,
+) = range(23)
 
 STOCK_ERROR_TEXT = {
     "not_enough": "Недостаточно на этом месте.",
@@ -156,6 +163,97 @@ async def render_stock_card(
         await _flush_activity_notices()
 
 
+async def render_purchase_card(
+    update: Update,
+    purchase_id: int,
+    *,
+    as_new: bool = False,
+) -> None:
+    screen = screens.purchase_card(purchase_id, _bot_username_from_update(update))
+    if screen is None:
+        await render_screen(update, None, as_new=as_new)
+        return
+    text, markup = screen
+    item = storage.get_purchase(purchase_id)
+    photos = (item or {}).get("photos") or []
+    photo = photos[0] if photos else ""
+    query = update.callback_query
+    chat = update.effective_chat
+
+    async def send_new() -> None:
+        if chat is None:
+            return
+        if photo:
+            await chat.send_photo(
+                photo=photo,
+                caption=text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await chat.send_message(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=_NO_PREVIEW,
+        )
+
+    if query and not as_new:
+        try:
+            await query.answer()
+        except BadRequest:
+            pass
+        try:
+            if photo:
+                await query.edit_message_media(
+                    media=InputMediaPhoto(
+                        media=photo,
+                        caption=text,
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    reply_markup=markup,
+                )
+            else:
+                await query.edit_message_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                    link_preview_options=_NO_PREVIEW,
+                )
+            return
+        except BadRequest:
+            pass
+        if query.message is not None:
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
+        await send_new()
+        return
+
+    await send_new()
+
+
+async def _send_purchase_photos(update: Update, photos: list[str]) -> None:
+    chat = update.effective_chat
+    if chat is None or not photos:
+        return
+    if len(photos) == 1:
+        await chat.send_photo(photo=photos[0])
+        return
+    media = [
+        InputMediaPhoto(media=file_id)
+        for file_id in photos[: storage.MAX_PURCHASE_PHOTOS]
+    ]
+    await chat.send_media_group(media=media)
+
+
+def _bot_username_from_update(_update: Update) -> str:
+    if _application is None:
+        return ""
+    return (_application.bot.username or "").lstrip("@")
+
+
 async def _render_stock_card(
     update: Update,
     item_id: int,
@@ -250,7 +348,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await render(update, *screens.blocked_screen(), as_new=True)
         return ConversationHandler.END
     kind, entity_id = _parse_start_arg(context)
-    if kind == "pel" and entity_id is not None:
+    if kind == "pel" and entity_id is not None and not _is_purchaser(update):
         screen = _pel_card(update, entity_id)
         if screen is None:
             await render(
@@ -273,6 +371,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
         else:
             await render_stock_card(update, entity_id, as_new=True)
+        return ConversationHandler.END
+    if kind == "buy" and entity_id is not None and _is_purchaser(update):
+        if storage.get_purchase(entity_id) is None:
+            await render(
+                update,
+                f"Закупка <code>#{entity_id}</code> не найдена.\n\n"
+                + _home(update)[0],
+                _home(update)[1],
+                as_new=True,
+            )
+        else:
+            await render_purchase_card(update, entity_id, as_new=True)
+        return ConversationHandler.END
+    if kind == "req" and entity_id is not None:
+        screen = screens.request_card(
+            entity_id,
+            as_purchaser=_is_purchaser(update),
+            viewer_id=_viewer_id(update),
+        )
+        if screen is None:
+            await render(
+                update,
+                f"Заявка <code>#{entity_id}</code> не найдена.\n\n"
+                + _home(update)[0],
+                _home(update)[1],
+                as_new=True,
+            )
+        else:
+            await render_screen(update, screen, as_new=True)
         return ConversationHandler.END
     await render(update, *_home(update), as_new=True)
     return ConversationHandler.END
@@ -325,20 +452,53 @@ def _viewer_id(update: Update) -> int | None:
     return None if user is None else user.id
 
 
-def _is_admin(update: Update) -> bool:
+def _viewer_user(update: Update) -> dict | None:
     user = update.effective_user
     if user is None:
-        return False
-    db_user = storage.get_user(user.id)
+        return None
+    return storage.get_user(user.id)
+
+
+def _role(update: Update) -> str:
+    db_user = _viewer_user(update)
+    if db_user is None:
+        return "worker"
+    return str(db_user.get("role") or "worker")
+
+
+def _is_admin(update: Update) -> bool:
+    db_user = _viewer_user(update)
     return bool(
         db_user
-        and db_user.get("role") == "admin"
+        and db_user.get("role") in ("owner", "admin")
+        and (db_user.get("status") or "active") == "active"
+    )
+
+
+def _is_owner(update: Update) -> bool:
+    db_user = _viewer_user(update)
+    return bool(
+        db_user
+        and db_user.get("role") == "owner"
+        and (db_user.get("status") or "active") == "active"
+    )
+
+
+def _is_purchaser(update: Update) -> bool:
+    db_user = _viewer_user(update)
+    return bool(
+        db_user
+        and db_user.get("role") == "purchaser"
         and (db_user.get("status") or "active") == "active"
     )
 
 
 def _home(update: Update) -> tuple:
-    return screens.home_screen(is_admin=_is_admin(update))
+    return screens.home_screen(_role(update), viewer_id=_viewer_id(update))
+
+
+def _users_view(update: Update) -> tuple:
+    return screens.users_screen(_viewer_user(update))
 
 
 def _bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -404,6 +564,16 @@ def _parse_start_arg(context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, in
         if item_id <= 0:
             return None, None
         return "stock", item_id
+    if prefix == "b":
+        item_id = storage.parse_purchase_id(rest)
+        if item_id is None:
+            return None, None
+        return "buy", item_id
+    if prefix == "r":
+        item_id = storage.parse_purchase_id(rest)
+        if item_id is None:
+            return None, None
+        return "req", item_id
     return None, None
 
 
@@ -492,14 +662,23 @@ async def _show_logs(
     context: ContextTypes.DEFAULT_TYPE,
     offset: int = 0,
 ) -> None:
-    filters = storage.normalize_activity_filters(
+    role = _role(update)
+    raw = storage.normalize_activity_filters(
         context.user_data.get("logs_filters") or {}
     )
-    context.user_data["logs_filters"] = filters
+    context.user_data["logs_filters"] = raw
+    filters = storage.activity_filters_for_role(raw, role)
+    hide_pels = role == "purchaser"
     if _is_admin(update):
-        await render(update, *screens.logs_screen(offset, filters))
+        await render(
+            update,
+            *screens.logs_screen(offset, filters, hide_pels=hide_pels),
+        )
         return
-    await render(update, *screens.logs_request_screen(filters))
+    await render(
+        update,
+        *screens.logs_request_screen(raw, hide_pels=hide_pels),
+    )
 
 
 async def notify_admins_log_request(
@@ -533,7 +712,11 @@ async def _deliver_log_history(
     telegram_id: int,
     filters: dict | None,
 ) -> None:
-    src = storage.normalize_activity_filters(filters)
+    requester = storage.get_user(telegram_id)
+    src = storage.activity_filters_for_role(
+        filters,
+        None if requester is None else requester.get("role"),
+    )
     total = storage.count_activity(src)
     items = storage.list_activity(
         offset=0,
@@ -598,8 +781,9 @@ async def submit_log_request(
     user_id = _viewer_id(update)
     if user_id is None:
         return ConversationHandler.END
-    filters = storage.normalize_activity_filters(
-        context.user_data.get("logs_filters") or {}
+    filters = storage.activity_filters_for_role(
+        context.user_data.get("logs_filters") or {},
+        _role(update),
     )
     request = storage.create_log_request(user_id, _booking_label(update), filters)
     sent = await notify_admins_log_request(context, request, except_id=user_id)
@@ -748,6 +932,39 @@ async def _notify_user(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, tex
         return
 
 
+async def notify_purchasers(
+    context: ContextTypes.DEFAULT_TYPE,
+    item: dict,
+    *,
+    created: bool = False,
+    except_id: int | None = None,
+) -> None:
+    markup = screens.request_notify_markup(item["id"])
+    recipients: dict[int, bool] = {}
+    for user in storage.list_purchasers():
+        recipients[int(user["telegram_id"])] = False
+    if not created:
+        recipients[int(item["created_by"])] = True
+    if except_id is not None:
+        recipients.pop(int(except_id), None)
+    for telegram_id, for_author in recipients.items():
+        text = screens.request_notify_text(
+            item,
+            created=created,
+            for_author=for_author,
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=_NO_PREVIEW,
+            )
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            continue
+
+
 async def _show_check_step(update: Update, inspection: dict | None, pelengator_id: int | None = None) -> int:
     if inspection is None:
         if pelengator_id is not None:
@@ -867,7 +1084,10 @@ async def on_logs_callback(
         return ConversationHandler.END
     if data == "logs:add":
         context.user_data.pop("logs_draft", None)
-        await render(update, *screens.logs_add_filter_screen())
+        await render(
+            update,
+            *screens.logs_add_filter_screen(hide_pels=_is_purchaser(update)),
+        )
         return ConversationHandler.END
     if data == "logs:clr":
         context.user_data["logs_filters"] = {}
@@ -893,6 +1113,14 @@ async def on_logs_callback(
         await _show_logs(update, context)
         return ConversationHandler.END
     if data == "logs:fk:pels":
+        if _is_purchaser(update):
+            if query is not None:
+                try:
+                    await query.answer("Недоступно для закупщика", show_alert=True)
+                except BadRequest:
+                    pass
+            await _show_logs(update, context)
+            return ConversationHandler.END
         return await start_logs_pels_filter(update, context)
     if data == "logs:pels":
         await render(
@@ -911,7 +1139,13 @@ async def on_logs_callback(
         return ConversationHandler.END
     if data == "logs:fk:ops":
         draft = _start_logs_draft(context)
-        await render(update, *screens.logs_ops_filter_screen(draft))
+        await render(
+            update,
+            *screens.logs_ops_filter_screen(
+                draft,
+                hide_pels=_is_purchaser(update),
+            ),
+        )
         return ConversationHandler.END
     if data == "logs:fk:time":
         draft = _start_logs_draft(context)
@@ -969,8 +1203,16 @@ async def on_logs_callback(
         if action not in storage.ACTIVITY_ACTION_KEYS:
             return ConversationHandler.END
         draft = _logs_draft(context)
+        if _is_purchaser(update) and action in storage.PURCHASER_HIDDEN_ACTIONS:
+            return ConversationHandler.END
         draft["actions"] = _toggle_list_value(draft.get("actions") or [], action)
-        await render(update, *screens.logs_ops_filter_screen(draft))
+        await render(
+            update,
+            *screens.logs_ops_filter_screen(
+                draft,
+                hide_pels=_is_purchaser(update),
+            ),
+        )
         return ConversationHandler.END
     if data.startswith("logs:ts:"):
         preset = data.split(":")[2] if len(data.split(":")) > 2 else ""
@@ -1014,6 +1256,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if query is None or not query.data:
         return None
     data = query.data
+
+    if _is_purchaser(update) and (
+        data in {"nav:types", "nav:pels", "nav:arch", "nav:errs"}
+        or data.startswith(("type:", "pel:", "err:", "chk:"))
+    ):
+        await query.answer("Недоступно для закупщика", show_alert=True)
+        return ConversationHandler.END
+    if not _is_purchaser(update) and (
+        data in {"nav:buys", "nav:buyarch"} or data.startswith("buy:")
+    ):
+        await query.answer("Закупки доступны закупщику", show_alert=True)
+        return ConversationHandler.END
 
     if data == "nav:home":
         return await show_home(update, context)
@@ -1060,16 +1314,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         if not _is_admin(update):
             await query.answer("Недостаточно прав", show_alert=True)
             return ConversationHandler.END
-        await render(update, *screens.users_screen(_viewer_id(update)))
+        await render(update, *_users_view(update))
         return ConversationHandler.END
-    if data.startswith("usr:adm:"):
+    if data.startswith("usr:role:"):
         if not _is_admin(update):
             await query.answer("Недостаточно прав", show_alert=True)
             return ConversationHandler.END
         target_id = int(data.split(":")[2])
-        storage.set_user_role(target_id, "admin")
-        await query.answer("Теперь админ")
-        await render(update, *screens.users_screen(_viewer_id(update)))
+        target = storage.get_user(target_id)
+        if target is None:
+            await query.answer("Пользователь не найден", show_alert=True)
+            return ConversationHandler.END
+        await render(
+            update,
+            *screens.user_role_screen(target, _viewer_user(update)),
+        )
+        return ConversationHandler.END
+    if data.startswith("usr:set:"):
+        if not _is_admin(update):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return ConversationHandler.END
+        parts = data.split(":")
+        target_id = int(parts[2])
+        new_role = parts[3] if len(parts) > 3 else ""
+        target = storage.get_user(target_id)
+        actor = _viewer_user(update)
+        if not storage.can_assign_role(actor, target, new_role):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return ConversationHandler.END
+        storage.set_user_role(target_id, new_role)
+        await query.answer(storage.ROLE_LABELS.get(new_role, new_role))
+        await render(update, *_users_view(update))
         return ConversationHandler.END
     if data.startswith("usr:ok:") or data.startswith("usr:bl:") or data.startswith("usr:un:"):
         if not _is_admin(update):
@@ -1084,6 +1359,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         target = storage.get_user(target_id)
         if target is None:
             await query.answer("Пользователь не найден", show_alert=True)
+            return ConversationHandler.END
+        if action == "bl" and target.get("role") == "owner":
+            await query.answer("Владельца заблокировать нельзя", show_alert=True)
+            return ConversationHandler.END
+        if (
+            action == "bl"
+            and target.get("role") == "admin"
+            and not _is_owner(update)
+        ):
+            await query.answer("Админа может заблокировать только владелец", show_alert=True)
             return ConversationHandler.END
         if action == "ok":
             storage.set_user_status(target_id, "active")
@@ -1112,8 +1397,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                 return ConversationHandler.END
             except BadRequest:
                 pass
-        await render(update, *screens.users_screen(_viewer_id(update)))
+        await render(update, *_users_view(update))
         return ConversationHandler.END
+    if data == "nav:buys":
+        context.user_data.clear()
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context)),
+        )
+        return ConversationHandler.END
+    if data == "nav:buyarch":
+        context.user_data.clear()
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context), archived=True),
+        )
+        return ConversationHandler.END
+    if data == "nav:reqs" or data.startswith("req:") or data.startswith("buy:"):
+        return await on_buy_callback(update, context)
 
     if data.startswith("err:list:"):
         kind = screens.kind_from_code(data.split(":")[2])
@@ -2320,10 +2621,513 @@ async def err_edit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 _last_network_log = 0.0
 
 
+BUY_FIELD_PROMPTS = {
+    "name": "Введите наименование:",
+    "supplier_name": "Введите поставщика:",
+    "invoice_number": "Введите номер счёта:",
+    "invoice_date": "Введите дату счёта, например <code>13.10.2026</code>:",
+}
+
+
+@need_user
+async def on_buy_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int | None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return None
+    data = query.data
+    if data == "nav:buys":
+        context.user_data.clear()
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context)),
+        )
+        return ConversationHandler.END
+    if data == "nav:buyarch":
+        context.user_data.clear()
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context), archived=True),
+        )
+        return ConversationHandler.END
+    if data == "nav:reqs":
+        await render(
+            update,
+            *screens.requests_screen(
+                viewer_id=_viewer_id(update) or 0,
+                as_purchaser=_is_purchaser(update),
+                bot_username=_bot_username(context),
+            ),
+        )
+        return ConversationHandler.END
+    if data == "buy:add":
+        return await start_add_purchase(update, context)
+    if data == "buy:noph":
+        if not _is_purchaser(update):
+            await query.answer("Закупки доступны закупщику", show_alert=True)
+            return ConversationHandler.END
+        context.user_data["buy_photo_file_id"] = ""
+        context.user_data["cancel_back"] = "nav:buys"
+        await render(update, *_ask(context, "Введите наименование:"))
+        return BUY_NAME
+    if data.startswith("buy:v:"):
+        await render_purchase_card(update, int(data.split(":")[2]))
+        return ConversationHandler.END
+    if data.startswith("buy:ar:"):
+        purchase_id = int(data.split(":")[2])
+        item = storage.get_purchase(purchase_id)
+        if item is None:
+            await render(
+                update,
+                *screens.purchases_screen(_bot_username(context)),
+            )
+            return ConversationHandler.END
+        now_archived = not bool(item.get("is_archived"))
+        storage.set_purchase_archived(purchase_id, now_archived)
+        await query.answer("В архиве" if now_archived else "Достали из архива")
+        await render_purchase_card(update, purchase_id)
+        return ConversationHandler.END
+    if data.startswith("buy:ph:"):
+        return await start_purchase_photo(update, context)
+    if data.startswith("buy:ps:"):
+        purchase_id = int(data.split(":")[2])
+        item = storage.get_purchase(purchase_id)
+        photos = [] if item is None else (item.get("photos") or [])
+        if not photos:
+            await query.answer("Фото нет")
+            return ConversationHandler.END
+        await query.answer()
+        await _send_purchase_photos(update, photos)
+        return ConversationHandler.END
+    if data.startswith("buy:px:"):
+        purchase_id = int(data.split(":")[2])
+        storage.clear_purchase_photos(purchase_id)
+        await query.answer("Фото удалены")
+        await render_purchase_card(update, purchase_id)
+        return ConversationHandler.END
+    if data.startswith("buy:e:"):
+        return await start_edit_purchase_field(update, context)
+    if data == "req:add":
+        return await start_add_request(update, context)
+    if data.startswith("req:v:"):
+        request_id = int(data.split(":")[2])
+        screen = screens.request_card(
+            request_id,
+            as_purchaser=_is_purchaser(update),
+            viewer_id=_viewer_id(update),
+        )
+        await render_screen(update, screen)
+        return ConversationHandler.END
+    if data.startswith("req:st:"):
+        if not _is_purchaser(update):
+            await query.answer("Статус меняет закупщик", show_alert=True)
+            return ConversationHandler.END
+        parts = data.split(":")
+        request_id = int(parts[2])
+        status = storage.REQUEST_STATUS_CODES.get(parts[3] if len(parts) > 3 else "")
+        if not status:
+            await query.answer("Неизвестный статус", show_alert=True)
+            return ConversationHandler.END
+        item = storage.set_purchase_request_status(request_id, status)
+        if item is None:
+            await query.answer("Не удалось сменить статус", show_alert=True)
+            return ConversationHandler.END
+        await query.answer(storage.REQUEST_STATUS_LABELS.get(status, status))
+        await notify_purchasers(
+            context,
+            item,
+            except_id=_viewer_id(update),
+        )
+        await render_screen(
+            update,
+            screens.request_card(
+                request_id,
+                as_purchaser=True,
+                viewer_id=_viewer_id(update),
+            ),
+        )
+        return ConversationHandler.END
+    return None
+
+
+@need_user
+async def start_add_purchase(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not _is_purchaser(update):
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Закупки доступны закупщику",
+                show_alert=True,
+            )
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["buy_creating"] = True
+    context.user_data["cancel_back"] = "nav:buys"
+    await render(update, *screens.purchase_wizard_photo())
+    return BUY_PHOTO
+
+
+@need_user
+async def start_purchase_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not _is_purchaser(update):
+        return ConversationHandler.END
+    purchase_id = int(update.callback_query.data.split(":")[2])
+    item = storage.get_purchase(purchase_id)
+    if item is None:
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context)),
+        )
+        return ConversationHandler.END
+    photos = item.get("photos") or []
+    if len(photos) >= storage.MAX_PURCHASE_PHOTOS:
+        if update.callback_query:
+            await update.callback_query.answer(
+                f"Максимум {storage.MAX_PURCHASE_PHOTOS} фото",
+                show_alert=True,
+            )
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["buy_id"] = purchase_id
+    context.user_data["cancel_back"] = f"buy:v:{purchase_id}"
+    await render(
+        update,
+        *screens.purchase_photo_prompt(
+            purchase_id,
+            item["name"],
+            count=len(photos),
+        ),
+    )
+    return BUY_PHOTO
+
+
+@need_user
+async def start_edit_purchase_field(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not _is_purchaser(update):
+        return ConversationHandler.END
+    _, _, purchase_id, field = update.callback_query.data.split(":", 3)
+    purchase_id = int(purchase_id)
+    if field not in BUY_FIELD_PROMPTS:
+        return ConversationHandler.END
+    item = storage.get_purchase(purchase_id)
+    if item is None:
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context)),
+        )
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["buy_id"] = purchase_id
+    context.user_data["buy_field"] = field
+    context.user_data["cancel_back"] = f"buy:v:{purchase_id}"
+    await render(update, *_ask(context, BUY_FIELD_PROMPTS[field]))
+    return BUY_EDIT
+
+
+@need_user
+async def start_add_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if _is_purchaser(update):
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Заявку создаёт работник или админ",
+                show_alert=True,
+            )
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["cancel_back"] = "nav:reqs"
+    await render(
+        update,
+        *_ask(context, "Опишите, что нужно закупить:"),
+    )
+    return REQ_DESC
+
+
+async def buy_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _bind_actor(update)
+    file_id = _message_photo_id(update.message)
+    if context.user_data.get("buy_creating"):
+        if not file_id:
+            await render(update, *screens.purchase_wizard_photo(), as_new=True)
+            return BUY_PHOTO
+        context.user_data["buy_photo_file_id"] = file_id
+        context.user_data["cancel_back"] = "nav:buys"
+        await render(
+            update,
+            *_ask(context, "Введите наименование:"),
+            as_new=True,
+        )
+        return BUY_NAME
+    purchase_id = context.user_data.get("buy_id")
+    item = None if purchase_id is None else storage.get_purchase(purchase_id)
+    if item is None or not file_id:
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context)),
+            as_new=True,
+        )
+        return ConversationHandler.END
+    error = storage.add_purchase_photo(purchase_id, file_id)
+    if error == "too_many":
+        context.user_data.clear()
+        await render_purchase_card(update, purchase_id, as_new=True)
+        return ConversationHandler.END
+    item = storage.get_purchase(purchase_id)
+    photos = [] if item is None else (item.get("photos") or [])
+    if len(photos) >= storage.MAX_PURCHASE_PHOTOS:
+        context.user_data.clear()
+        await render_purchase_card(update, purchase_id, as_new=True)
+        return ConversationHandler.END
+    await render(
+        update,
+        *screens.purchase_photo_prompt(
+            purchase_id,
+            item["name"],
+            count=len(photos),
+        ),
+        as_new=True,
+    )
+    return BUY_PHOTO
+
+
+async def buy_photo_wrong(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if context.user_data.get("buy_creating"):
+        await render(update, *screens.purchase_wizard_photo(), as_new=True)
+        return BUY_PHOTO
+    purchase_id = context.user_data.get("buy_id")
+    item = None if purchase_id is None else storage.get_purchase(purchase_id)
+    if item is None:
+        await render(
+            update,
+            *screens.purchases_screen(_bot_username(context)),
+            as_new=True,
+        )
+        return ConversationHandler.END
+    await render(
+        update,
+        *screens.purchase_photo_prompt(
+            purchase_id,
+            item["name"],
+            count=len(item.get("photos") or []),
+        ),
+        as_new=True,
+    )
+    return BUY_PHOTO
+
+
+async def buy_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = storage.normalize_stock_text(update.message.text if update.message else None)
+    if not name:
+        await render(
+            update,
+            *_ask(context, "Название пустое. Введите наименование:"),
+            as_new=True,
+        )
+        return BUY_NAME
+    if len(name) > storage.MAX_PURCHASE_NAME:
+        await render(
+            update,
+            *_ask(
+                context,
+                f"Слишком длинное название (макс. {storage.MAX_PURCHASE_NAME}). "
+                "Введите наименование:",
+            ),
+            as_new=True,
+        )
+        return BUY_NAME
+    context.user_data["buy_name"] = name
+    await render(update, *_ask(context, "Введите поставщика:"), as_new=True)
+    return BUY_SUPPLIER
+
+
+async def buy_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = storage.normalize_stock_text(update.message.text if update.message else None)
+    if not value or len(value) > storage.MAX_PURCHASE_FIELD:
+        await render(
+            update,
+            *_ask(context, "Введите поставщика:"),
+            as_new=True,
+        )
+        return BUY_SUPPLIER
+    context.user_data["buy_supplier"] = value
+    await render(update, *_ask(context, "Введите номер счёта:"), as_new=True)
+    return BUY_INVOICE
+
+
+async def buy_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = storage.normalize_stock_text(update.message.text if update.message else None)
+    if not value or len(value) > storage.MAX_PURCHASE_FIELD:
+        await render(
+            update,
+            *_ask(context, "Введите номер счёта:"),
+            as_new=True,
+        )
+        return BUY_INVOICE
+    context.user_data["buy_invoice"] = value
+    await render(
+        update,
+        *_ask(
+            context,
+            "Введите дату счёта, например <code>13.10.2026</code>:",
+        ),
+        as_new=True,
+    )
+    return BUY_DATE
+
+
+async def buy_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    parsed = storage.parse_invoice_date(
+        _non_empty(update.message.text if update.message else None)
+    )
+    if not parsed:
+        await render(
+            update,
+            *_ask(
+                context,
+                "Не понял дату. Введите как <code>13.10.2026</code>:",
+            ),
+            as_new=True,
+        )
+        return BUY_DATE
+    user_id = _viewer_id(update)
+    if user_id is None:
+        return ConversationHandler.END
+    purchase_id = storage.create_purchase(
+        context.user_data.get("buy_name") or "",
+        created_by=user_id,
+        supplier_name=context.user_data.get("buy_supplier") or "",
+        invoice_number=context.user_data.get("buy_invoice") or "",
+        invoice_date=parsed,
+        photo_file_id=context.user_data.get("buy_photo_file_id") or "",
+    )
+    context.user_data.clear()
+    if purchase_id is None:
+        await render(
+            update,
+            "Не удалось создать закупку.\n\n" + _home(update)[0],
+            _home(update)[1],
+            as_new=True,
+        )
+        return ConversationHandler.END
+    await render_purchase_card(update, purchase_id, as_new=True)
+    return ConversationHandler.END
+
+
+async def buy_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    purchase_id = context.user_data.get("buy_id")
+    field = context.user_data.get("buy_field")
+    raw = _non_empty(update.message.text if update.message else None)
+    if purchase_id is None or field not in BUY_FIELD_PROMPTS:
+        await render(update, *_home(update), as_new=True)
+        return ConversationHandler.END
+    ok = storage.update_purchase_field(purchase_id, field, raw)
+    if not ok:
+        await render(
+            update,
+            *_ask(context, BUY_FIELD_PROMPTS[field]),
+            as_new=True,
+        )
+        return BUY_EDIT
+    context.user_data.clear()
+    await render_purchase_card(update, purchase_id, as_new=True)
+    return ConversationHandler.END
+
+
+async def req_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    description = storage.normalize_stock_text(
+        update.message.text if update.message else None
+    )
+    if not description:
+        await render(
+            update,
+            *_ask(context, "Опишите, что нужно закупить:"),
+            as_new=True,
+        )
+        return REQ_DESC
+    if len(description) > storage.MAX_REQUEST_DESC:
+        await render(
+            update,
+            *_ask(
+                context,
+                f"Слишком длинно (макс. {storage.MAX_REQUEST_DESC}). "
+                "Опишите короче:",
+            ),
+            as_new=True,
+        )
+        return REQ_DESC
+    user_id = _viewer_id(update)
+    if user_id is None:
+        return ConversationHandler.END
+    item = storage.create_purchase_request(description, user_id)
+    context.user_data.clear()
+    if item is None:
+        await render(update, *_home(update), as_new=True)
+        return ConversationHandler.END
+    await notify_purchasers(context, item, created=True, except_id=user_id)
+    await render_screen(
+        update,
+        screens.request_card(
+            item["id"],
+            as_purchaser=False,
+            viewer_id=user_id,
+        ),
+        as_new=True,
+    )
+    return ConversationHandler.END
+
+
 @need_user
 async def open_by_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = storage.normalize_stock_text(update.message.text if update.message else None)
     if not text:
+        return
+    if _is_purchaser(update):
+        if text.isdigit():
+            purchase_id = storage.parse_purchase_id(text)
+            if purchase_id is None:
+                await update.message.reply_text(
+                    f"id должен быть числом от 1 до {storage.MAX_PELENGATOR_ID}.",
+                )
+                return
+            item = storage.get_purchase(purchase_id)
+            if item is None:
+                await update.message.reply_text(
+                    f"Закупка <code>#{purchase_id}</code> не найдена.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await render_purchase_card(update, purchase_id, as_new=True)
+            return
+        if not any(ch.isalpha() for ch in text):
+            return
+        matches = storage.best_purchase_matches(text)
+        if not matches:
+            await update.message.reply_text("Ничего не нашлось.")
+            return
+        await render(
+            update,
+            *screens.purchase_search_screen(
+                text,
+                matches,
+                _bot_username(context),
+            ),
+            as_new=True,
+        )
         return
     if text.isdigit():
         pelengator_id = storage.parse_pelengator_id(text)
@@ -2372,6 +3176,17 @@ async def start_logs_pels_filter(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
+    if _is_purchaser(update):
+        if update.callback_query:
+            try:
+                await update.callback_query.answer(
+                    "Недоступно для закупщика",
+                    show_alert=True,
+                )
+            except BadRequest:
+                pass
+        await _show_logs(update, context)
+        return ConversationHandler.END
     draft = _start_logs_draft(context)
     await render(update, *screens.logs_pels_filter_screen(draft))
     return LOGS_PEL_FILTER
@@ -2516,6 +3331,10 @@ def main() -> None:
             CallbackQueryHandler(on_stock_callback, pattern=r"^stk:"),
             CallbackQueryHandler(start_logs_time, pattern=r"^logs:tc$"),
             CallbackQueryHandler(start_logs_pels_filter, pattern=r"^logs:fk:pels$"),
+            CallbackQueryHandler(start_add_purchase, pattern=r"^buy:add$"),
+            CallbackQueryHandler(start_purchase_photo, pattern=r"^buy:ph:"),
+            CallbackQueryHandler(start_edit_purchase_field, pattern=r"^buy:e:"),
+            CallbackQueryHandler(start_add_request, pattern=r"^req:add$"),
         ],
         states={
             USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_reg_name)],
@@ -2551,6 +3370,24 @@ def main() -> None:
             LOGS_PEL_FILTER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, logs_pel_filter_add)
             ],
+            BUY_PHOTO: [
+                MessageHandler(
+                    filters.PHOTO | filters.Document.IMAGE,
+                    buy_photo,
+                ),
+                CallbackQueryHandler(on_buy_callback, pattern=r"^buy:noph$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, buy_photo_wrong),
+            ],
+            BUY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_name)],
+            BUY_SUPPLIER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, buy_supplier)
+            ],
+            BUY_INVOICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, buy_invoice)
+            ],
+            BUY_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_date)],
+            BUY_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_edit)],
+            REQ_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_desc)],
         },
         fallbacks=[
             CommandHandler("start", cmd_start),

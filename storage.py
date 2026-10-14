@@ -243,6 +243,97 @@ def _ensure_column(
         )
 
 
+def _users_table_sql(connection: sqlite3.Connection) -> str:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    if row is None:
+        return ""
+    return str(row["sql"] or "")
+
+
+def _ensure_owner(connection: sqlite3.Connection) -> None:
+    owner = connection.execute(
+        "SELECT telegram_id FROM users WHERE role = 'owner' LIMIT 1"
+    ).fetchone()
+    if owner is not None:
+        return
+    first = connection.execute(
+        """
+        SELECT telegram_id FROM users
+        WHERE role = 'admin'
+        ORDER BY rowid
+        LIMIT 1
+        """
+    ).fetchone()
+    if first is None:
+        first = connection.execute(
+            "SELECT telegram_id FROM users ORDER BY rowid LIMIT 1"
+        ).fetchone()
+    if first is None:
+        return
+    connection.execute(
+        """
+        UPDATE users
+        SET role = 'owner', status = 'active'
+        WHERE telegram_id = ?
+        """,
+        (first["telegram_id"],),
+    )
+
+
+def _migrate_users_roles(connection: sqlite3.Connection) -> None:
+    sql = _users_table_sql(connection)
+    if not sql:
+        return
+    if "owner" in sql and "purchaser" in sql:
+        _ensure_owner(connection)
+        return
+    columns = _columns(connection, "users")
+    connection.execute(
+        """
+        CREATE TABLE users_mig (
+            telegram_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            username TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'worker', 'purchaser')),
+            status TEXT NOT NULL DEFAULT 'active',
+            notify_activity INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    rows = connection.execute("SELECT * FROM users").fetchall()
+    for row in rows:
+        keys = set(row.keys())
+        role = str(row["role"] or "worker")
+        if role not in USER_ROLES:
+            role = "worker"
+        status = "active"
+        if "status" in keys and row["status"]:
+            status = str(row["status"])
+        notify = 0
+        if "notify_activity" in keys:
+            notify = int(row["notify_activity"] or 0)
+        connection.execute(
+            """
+            INSERT INTO users_mig (
+                telegram_id, name, username, role, status, notify_activity
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["telegram_id"],
+                row["name"],
+                row["username"] or "",
+                role,
+                status,
+                notify,
+            ),
+        )
+    connection.execute("DROP TABLE users")
+    connection.execute("ALTER TABLE users_mig RENAME TO users")
+    _ensure_owner(connection)
+
+
 ACTIVITY_PAGE_SIZE = 12
 ACTIVITY_FILTER_PAGE_SIZE = 10
 LOG_EXPORT_LIMIT = 2000
@@ -273,6 +364,39 @@ ACTIVITY_TIME_PRESETS = {
     "30d": "30 дней",
     "custom": "Свой период",
 }
+
+USER_ROLES = ("owner", "admin", "worker", "purchaser")
+ASSIGNABLE_ROLES = ("admin", "worker", "purchaser")
+ROLE_LABELS = {
+    "owner": "Владелец",
+    "admin": "Администратор",
+    "worker": "Работник",
+    "purchaser": "Закупщик",
+}
+PURCHASER_HIDDEN_ACTIONS = tuple(
+    key
+    for key in ACTIVITY_ACTION_KEYS
+    if key.startswith("pel.") or key.startswith("error.")
+)
+PURCHASER_ALLOWED_ACTIONS = tuple(
+    key for key in ACTIVITY_ACTION_KEYS if key not in PURCHASER_HIDDEN_ACTIONS
+)
+REQUEST_STATUSES = ("new", "in_progress", "closed")
+REQUEST_STATUS_LABELS = {
+    "new": "Новая",
+    "in_progress": "Принята в работу",
+    "closed": "Закрыта",
+}
+REQUEST_STATUS_CODES = {
+    "n": "new",
+    "w": "in_progress",
+    "c": "closed",
+}
+REQUEST_STATUS_TO_CODE = {value: key for key, value in REQUEST_STATUS_CODES.items()}
+MAX_PURCHASE_NAME = 80
+MAX_PURCHASE_FIELD = 80
+MAX_PURCHASE_PHOTOS = 10
+MAX_REQUEST_DESC = 500
 
 
 def set_activity_actor(user_id: int | None, name: str = "") -> None:
@@ -364,7 +488,7 @@ def init_db() -> None:
                 telegram_id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 username TEXT NOT NULL DEFAULT '',
-                role TEXT NOT NULL CHECK (role IN ('admin', 'worker'))
+                role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'worker', 'purchaser'))
             );
 
             CREATE TABLE IF NOT EXISTS inspections (
@@ -415,6 +539,28 @@ def init_db() -> None:
                 requester_name TEXT NOT NULL DEFAULT '',
                 filters TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'pending'
+            );
+
+            CREATE TABLE IF NOT EXISTS purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                photo_file_id TEXT NOT NULL DEFAULT '',
+                photos TEXT NOT NULL DEFAULT '[]',
+                supplier_name TEXT NOT NULL DEFAULT '',
+                invoice_number TEXT NOT NULL DEFAULT '',
+                invoice_date TEXT NOT NULL DEFAULT '',
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS purchase_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -498,6 +644,13 @@ def init_db() -> None:
             "photo_file_id",
             "TEXT NOT NULL DEFAULT ''",
         )
+        _ensure_column(
+            connection,
+            "purchases",
+            "photos",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        _migrate_purchase_photos(connection)
         connection.execute(
             """
             UPDATE pelengators
@@ -518,6 +671,7 @@ def init_db() -> None:
                   AND board != ''
                 """
             )
+        _migrate_users_roles(connection)
         connection.commit()
         connection.close()
 
@@ -682,6 +836,10 @@ def parse_pelengator_id(raw: str) -> int | None:
     if value < 1 or value > MAX_PELENGATOR_ID:
         return None
     return value
+
+
+def parse_purchase_id(raw: str) -> int | None:
+    return parse_pelengator_id(raw)
 
 
 def add_pelengator(pelengator_id: int, type_id: int) -> str | None:
@@ -941,7 +1099,11 @@ def counts() -> dict:
                 (SELECT COUNT(*) FROM errors WHERE kind = 'hardware' AND COALESCE(is_deleted, 0) = 0) AS hardware,
                 (SELECT COUNT(*) FROM errors WHERE kind = 'soft' AND COALESCE(is_deleted, 0) = 0) AS soft,
                 (SELECT COUNT(*) FROM stock_items) AS stock_items,
-                (SELECT COALESCE(SUM(qty), 0) FROM stock_lots) AS stock_qty
+                (SELECT COALESCE(SUM(qty), 0) FROM stock_lots) AS stock_qty,
+                (SELECT COUNT(*) FROM purchases WHERE COALESCE(is_archived, 0) = 0) AS purchases,
+                (SELECT COUNT(*) FROM purchases WHERE COALESCE(is_archived, 0) = 1) AS archived_purchases,
+                (SELECT COUNT(*) FROM purchase_requests) AS requests,
+                (SELECT COUNT(*) FROM purchase_requests WHERE status != 'closed') AS requests_open
             """
         ).fetchone()
         connection.close()
@@ -954,6 +1116,10 @@ def counts() -> dict:
         "soft": row["soft"],
         "stock_items": row["stock_items"],
         "stock_qty": row["stock_qty"],
+        "purchases": row["purchases"],
+        "archived_purchases": row["archived_purchases"],
+        "requests": row["requests"],
+        "requests_open": row["requests_open"],
     }
 
 
@@ -1433,6 +1599,21 @@ def parse_log_datetime(raw: str | None, *, end_of_day: bool = False) -> str | No
             moment = moment.replace(hour=23, minute=59, second=59)
         return moment.isoformat(timespec="seconds")
     return None
+
+
+def activity_filters_for_role(filters: dict | None, role: str | None) -> dict:
+    src = normalize_activity_filters(filters)
+    if role != "purchaser":
+        return src
+    src.pop("pel_ids", None)
+    allowed = set(PURCHASER_ALLOWED_ACTIONS)
+    selected = src.get("actions")
+    if selected:
+        kept = [key for key in selected if key in allowed]
+        src["actions"] = kept if kept else ["__denied__"]
+    else:
+        src["actions"] = list(PURCHASER_ALLOWED_ACTIONS)
+    return src
 
 
 def normalize_activity_filters(filters: dict | None) -> dict:
@@ -2074,7 +2255,7 @@ def register_user(telegram_id: int, name: str, username: str | None) -> tuple[di
             connection.close()
             return _user_from_row(row), False
         total = connection.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-        role = "admin" if total == 0 else "worker"
+        role = "owner" if total == 0 else "worker"
         status = "active" if total == 0 else "pending"
         fields = ["telegram_id", "name", "username", "role"]
         values: list[object] = [telegram_id, name, nick, role]
@@ -2162,7 +2343,8 @@ def list_admins() -> list[dict]:
             """
             SELECT *
             FROM users
-            WHERE role = 'admin' AND (status = 'active' OR status IS NULL OR status = '')
+            WHERE role IN ('owner', 'admin')
+              AND (status = 'active' OR status IS NULL OR status = '')
             ORDER BY telegram_id
             """
         ).fetchall()
@@ -2170,13 +2352,58 @@ def list_admins() -> list[dict]:
     return [_user_from_row(row) for row in rows]
 
 
+def list_purchasers() -> list[dict]:
+    with _lock:
+        connection = _connect()
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE role = 'purchaser'
+              AND (status = 'active' OR status IS NULL OR status = '')
+            ORDER BY telegram_id
+            """
+        ).fetchall()
+        connection.close()
+    return [_user_from_row(row) for row in rows]
+
+
+def can_assign_role(actor: dict | None, target: dict | None, new_role: str) -> bool:
+    if actor is None or target is None:
+        return False
+    if (actor.get("status") or "active") != "active":
+        return False
+    if actor.get("telegram_id") == target.get("telegram_id"):
+        return False
+    if target.get("role") == "owner":
+        return False
+    if new_role not in ASSIGNABLE_ROLES:
+        return False
+    actor_role = actor.get("role")
+    if actor_role == "owner":
+        return True
+    if actor_role == "admin":
+        return (
+            target.get("role") not in ("owner", "admin")
+            and new_role in ("worker", "purchaser")
+        )
+    return False
+
+
 def set_user_role(telegram_id: int, role: str) -> bool:
-    if role not in ("admin", "worker"):
+    if role not in ASSIGNABLE_ROLES:
         return False
     with _lock:
         connection = _connect()
+        current = connection.execute(
+            "SELECT role FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        if current is None or str(current["role"] or "") == "owner":
+            connection.close()
+            return False
         columns = _columns(connection, "users")
-        if role == "admin" and "status" in columns:
+        if role in ("admin", "purchaser") and "status" in columns:
             cursor = connection.execute(
                 "UPDATE users SET role = ?, status = 'active' WHERE telegram_id = ?",
                 (role, telegram_id),
@@ -2467,6 +2694,443 @@ def best_stock_match(query: str) -> dict | None:
     if best_item is None or best_score <= 0:
         return None
     return {**best_item, "match_score": best_score}
+
+
+def _parse_photo_list(raw) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item or "").strip()]
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            data = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return [text] if text else []
+        if isinstance(data, list):
+            return [str(item) for item in data if str(item or "").strip()]
+        return []
+    return [text]
+
+
+def _dump_photo_list(photos: list[str]) -> str:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in photos:
+        file_id = str(item or "").strip()
+        if not file_id or file_id in seen:
+            continue
+        seen.add(file_id)
+        cleaned.append(file_id)
+        if len(cleaned) >= MAX_PURCHASE_PHOTOS:
+            break
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def _migrate_purchase_photos(connection: sqlite3.Connection) -> None:
+    if "purchases" not in {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }:
+        return
+    columns = _columns(connection, "purchases")
+    if "photos" not in columns:
+        return
+    rows = connection.execute("SELECT * FROM purchases").fetchall()
+    for row in rows:
+        keys = set(row.keys())
+        photos = _parse_photo_list(row["photos"] if "photos" in keys else "[]")
+        if not photos and "photo_file_id" in keys and row["photo_file_id"]:
+            photos = [str(row["photo_file_id"])]
+        dumped = _dump_photo_list(photos)
+        current = "" if "photos" not in keys or row["photos"] is None else str(row["photos"])
+        if current != dumped:
+            connection.execute(
+                "UPDATE purchases SET photos = ? WHERE id = ?",
+                (dumped, row["id"]),
+            )
+
+
+def parse_invoice_date(raw: str | None) -> str | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def _purchase_from_row(row: sqlite3.Row) -> dict:
+    keys = set(row.keys())
+    photos = _parse_photo_list(row["photos"] if "photos" in keys else [])
+    if not photos and "photo_file_id" in keys and row["photo_file_id"]:
+        photos = [str(row["photo_file_id"])]
+    return {
+        "id": int(row["id"]),
+        "name": str(row["name"] or ""),
+        "photos": photos,
+        "photo_file_id": photos[0] if photos else "",
+        "supplier_name": str(row["supplier_name"] or ""),
+        "invoice_number": str(row["invoice_number"] or ""),
+        "invoice_date": str(row["invoice_date"] or ""),
+        "is_archived": int(row["is_archived"] or 0) if "is_archived" in keys else 0,
+        "created_by": int(row["created_by"] or 0),
+        "created_at": str(row["created_at"] or ""),
+    }
+
+
+def create_purchase(
+    name: str,
+    *,
+    created_by: int,
+    supplier_name: str = "",
+    invoice_number: str = "",
+    invoice_date: str = "",
+    photo_file_id: str = "",
+) -> int | None:
+    name = normalize_stock_text(name)
+    if not name or len(name) > MAX_PURCHASE_NAME:
+        return None
+    supplier_name = normalize_stock_text(supplier_name)
+    invoice_number = normalize_stock_text(invoice_number)
+    invoice_date = normalize_stock_text(invoice_date)
+    if len(supplier_name) > MAX_PURCHASE_FIELD:
+        return None
+    if len(invoice_number) > MAX_PURCHASE_FIELD:
+        return None
+    with _lock:
+        connection = _connect()
+        photos = _dump_photo_list([photo_file_id] if photo_file_id else [])
+        columns = _columns(connection, "purchases")
+        fields = [
+            "name",
+            "photo_file_id",
+            "supplier_name",
+            "invoice_number",
+            "invoice_date",
+            "is_archived",
+            "created_by",
+            "created_at",
+        ]
+        values: list[object] = [
+            name,
+            photo_file_id or "",
+            supplier_name,
+            invoice_number,
+            invoice_date,
+            0,
+            created_by,
+            _now_iso(),
+        ]
+        if "photos" in columns:
+            fields.insert(2, "photos")
+            values.insert(2, photos)
+        placeholders = ", ".join("?" for _ in fields)
+        cursor = connection.execute(
+            f"INSERT INTO purchases ({', '.join(fields)}) VALUES ({placeholders})",
+            values,
+        )
+        purchase_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+    return purchase_id
+
+
+def get_purchase(purchase_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM purchases WHERE id = ?",
+            (purchase_id,),
+        ).fetchone()
+        connection.close()
+    return None if row is None else _purchase_from_row(row)
+
+
+def list_purchases(*, archived: bool | None = False) -> list[dict]:
+    with _lock:
+        connection = _connect()
+        if archived is None:
+            rows = connection.execute(
+                "SELECT * FROM purchases ORDER BY id DESC"
+            ).fetchall()
+        else:
+            flag = 1 if archived else 0
+            rows = connection.execute(
+                """
+                SELECT * FROM purchases
+                WHERE COALESCE(is_archived, 0) = ?
+                ORDER BY id DESC
+                """,
+                (flag,),
+            ).fetchall()
+        connection.close()
+    return [_purchase_from_row(row) for row in rows]
+
+
+def set_purchase_archived(purchase_id: int, archived: bool) -> bool:
+    with _lock:
+        connection = _connect()
+        cursor = connection.execute(
+            "UPDATE purchases SET is_archived = ? WHERE id = ?",
+            (1 if archived else 0, purchase_id),
+        )
+        connection.commit()
+        updated = cursor.rowcount > 0
+        connection.close()
+    return updated
+
+
+def _save_purchase_photos(
+    connection: sqlite3.Connection,
+    purchase_id: int,
+    photos: list[str],
+) -> bool:
+    dumped = _dump_photo_list(photos)
+    columns = _columns(connection, "purchases")
+    if "photos" in columns:
+        cursor = connection.execute(
+            "UPDATE purchases SET photos = ?, photo_file_id = ? WHERE id = ?",
+            (dumped, photos[0] if photos else "", purchase_id),
+        )
+    else:
+        cursor = connection.execute(
+            "UPDATE purchases SET photo_file_id = ? WHERE id = ?",
+            (photos[0] if photos else "", purchase_id),
+        )
+    return cursor.rowcount > 0
+
+
+def add_purchase_photo(purchase_id: int, file_id: str) -> str | None:
+    file_id = (file_id or "").strip()
+    if not file_id:
+        return "bad_photo"
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM purchases WHERE id = ?",
+            (purchase_id,),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            return "not_found"
+        photos = _purchase_from_row(row)["photos"]
+        if file_id in photos:
+            connection.close()
+            return None
+        if len(photos) >= MAX_PURCHASE_PHOTOS:
+            connection.close()
+            return "too_many"
+        photos.append(file_id)
+        _save_purchase_photos(connection, purchase_id, photos)
+        connection.commit()
+        connection.close()
+    return None
+
+
+def clear_purchase_photos(purchase_id: int) -> bool:
+    with _lock:
+        connection = _connect()
+        updated = _save_purchase_photos(connection, purchase_id, [])
+        connection.commit()
+        connection.close()
+    return updated
+
+
+def set_purchase_photo(purchase_id: int, file_id: str | None) -> bool:
+    if file_id:
+        return add_purchase_photo(purchase_id, file_id) is None
+    return clear_purchase_photos(purchase_id)
+
+
+def update_purchase_field(purchase_id: int, field: str, value: str) -> bool:
+    allowed = {
+        "name": MAX_PURCHASE_NAME,
+        "supplier_name": MAX_PURCHASE_FIELD,
+        "invoice_number": MAX_PURCHASE_FIELD,
+        "invoice_date": MAX_PURCHASE_FIELD,
+    }
+    if field not in allowed:
+        return False
+    if field == "invoice_date":
+        parsed = parse_invoice_date(value)
+        if parsed is None:
+            return False
+        value = parsed
+    else:
+        value = normalize_stock_text(value)
+        if not value or len(value) > allowed[field]:
+            return False
+        if field == "name" and not value:
+            return False
+    with _lock:
+        connection = _connect()
+        cursor = connection.execute(
+            f"UPDATE purchases SET {field} = ? WHERE id = ?",
+            (value, purchase_id),
+        )
+        connection.commit()
+        updated = cursor.rowcount > 0
+        connection.close()
+    return updated
+
+
+def best_purchase_matches(query: str) -> list[dict]:
+    query = normalize_stock_text(query)
+    if not query:
+        return []
+    scored: list[tuple[int, dict]] = []
+    for item in list_purchases(archived=None):
+        score = letter_shift_score(query, item["name"])
+        scored.append((score, item))
+    if not scored:
+        return []
+    best = max(score for score, _item in scored)
+    if best <= 1:
+        return []
+    return [
+        {**item, "match_score": best}
+        for score, item in scored
+        if score == best
+    ]
+
+
+def _request_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "id": int(row["id"]),
+        "description": str(row["description"] or ""),
+        "status": str(row["status"] or "new"),
+        "created_by": int(row["created_by"] or 0),
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
+def create_purchase_request(description: str, created_by: int) -> dict | None:
+    description = normalize_stock_text(description)
+    if not description or len(description) > MAX_REQUEST_DESC:
+        return None
+    now = _now_iso()
+    with _lock:
+        connection = _connect()
+        cursor = connection.execute(
+            """
+            INSERT INTO purchase_requests (
+                description, status, created_by, created_at, updated_at
+            ) VALUES (?, 'new', ?, ?, ?)
+            """,
+            (description, created_by, now, now),
+        )
+        request_id = cursor.lastrowid
+        connection.commit()
+        row = connection.execute(
+            "SELECT * FROM purchase_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.close()
+    return None if row is None else _request_from_row(row)
+
+
+def get_purchase_request(request_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM purchase_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.close()
+    return None if row is None else _request_from_row(row)
+
+
+def list_purchase_requests(*, created_by: int | None = None) -> list[dict]:
+    with _lock:
+        connection = _connect()
+        if created_by is None:
+            rows = connection.execute(
+                """
+                SELECT * FROM purchase_requests
+                ORDER BY CASE status
+                    WHEN 'new' THEN 0
+                    WHEN 'in_progress' THEN 1
+                    ELSE 2
+                END, id DESC
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM purchase_requests
+                WHERE created_by = ?
+                ORDER BY CASE status
+                    WHEN 'new' THEN 0
+                    WHEN 'in_progress' THEN 1
+                    ELSE 2
+                END, id DESC
+                """,
+                (created_by,),
+            ).fetchall()
+        connection.close()
+    return [_request_from_row(row) for row in rows]
+
+
+def count_purchase_requests(*, created_by: int | None = None) -> dict:
+    with _lock:
+        connection = _connect()
+        if created_by is None:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status != 'closed' THEN 1 ELSE 0 END) AS open
+                FROM purchase_requests
+                """
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status != 'closed' THEN 1 ELSE 0 END) AS open
+                FROM purchase_requests
+                WHERE created_by = ?
+                """,
+                (created_by,),
+            ).fetchone()
+        connection.close()
+    return {
+        "total": int(row["total"] or 0),
+        "open": int(row["open"] or 0),
+    }
+
+
+def set_purchase_request_status(request_id: int, status: str) -> dict | None:
+    if status not in REQUEST_STATUSES:
+        return None
+    with _lock:
+        connection = _connect()
+        cursor = connection.execute(
+            """
+            UPDATE purchase_requests
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, _now_iso(), request_id),
+        )
+        if cursor.rowcount == 0:
+            connection.close()
+            return None
+        connection.commit()
+        row = connection.execute(
+            "SELECT * FROM purchase_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.close()
+    return None if row is None else _request_from_row(row)
 
 
 def add_stock_item(name: str) -> int | None:
