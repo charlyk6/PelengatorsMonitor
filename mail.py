@@ -1,5 +1,6 @@
 import os
 import smtplib
+import socket
 import ssl
 from email.message import EmailMessage
 from html import unescape
@@ -32,6 +33,34 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
+def _connect_ipv4(host: str, port: int, timeout: float) -> socket.socket:
+    last_error: Exception | None = None
+    for info in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        family, socktype, proto, _canon, address = info
+        sock = socket.socket(family, socktype, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(address)
+            return sock
+        except OSError as error:
+            last_error = error
+            sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"Нет IPv4-адреса у {host}")
+
+
+class _SMTP(smtplib.SMTP):
+    def _get_socket(self, host, port, timeout):
+        return _connect_ipv4(host, port, timeout)
+
+
+class _SMTP_SSL(smtplib.SMTP_SSL):
+    def _get_socket(self, host, port, timeout):
+        sock = _connect_ipv4(host, port, timeout)
+        return self.context.wrap_socket(sock, server_hostname=host)
+
+
 def _open_smtp() -> smtplib.SMTP:
     host = MAIL_SMTP_HOST
     context = _ssl_context()
@@ -53,9 +82,9 @@ def _open_smtp() -> smtplib.SMTP:
     for mode, port in attempts:
         try:
             if mode == "ssl":
-                smtp = smtplib.SMTP_SSL(host, port, context=context, timeout=8)
+                smtp = _SMTP_SSL(host, port, context=context, timeout=8)
             else:
-                smtp = smtplib.SMTP(host, port, timeout=8)
+                smtp = _SMTP(host, port, timeout=8)
                 smtp.ehlo()
                 smtp.starttls(context=context)
                 smtp.ehlo()
