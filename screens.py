@@ -1465,21 +1465,34 @@ ROLE_LABEL = storage.ROLE_LABELS
 
 def profile_screen(user: dict) -> tuple[str, InlineKeyboardMarkup]:
     role = storage.ROLE_LABELS.get(user.get("role") or "worker", "Работник")
+    email = user.get("email") or ""
     text = (
         "<b>Профиль</b>\n\n"
         f"<b>Имя:</b> {escape(user.get('name') or '—')}\n"
-        f"<b>Роль:</b> {escape(role)}"
+        f"<b>Роль:</b> {escape(role)}\n"
+        f"<b>Почта:</b> {escape(email) if email else '—'}"
     )
     keyboard = _markup(
         [
             [_btn("Сменить имя", "me:name")],
+            [_btn("Почта", "me:mail")],
             [_btn("Логи", "nav:logs")],
             [
                 _btn(
-                    "Выключить уведомления"
-                    if user.get("notify_activity")
-                    else "Включить уведомления",
+                    _check_label(
+                        bool(user.get("notify_activity")),
+                        "Уведомления в тг",
+                    ),
                     "me:ntf",
+                )
+            ],
+            [
+                _btn(
+                    _check_label(
+                        bool(user.get("notify_email")),
+                        "Уведомления на почту",
+                    ),
+                    "me:entf",
                 )
             ],
             [_btn("← Меню", "nav:home")],

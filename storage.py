@@ -595,6 +595,18 @@ def init_db() -> None:
             "notify_activity",
             "INTEGER NOT NULL DEFAULT 0",
         )
+        _ensure_column(
+            connection,
+            "users",
+            "email",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        _ensure_column(
+            connection,
+            "users",
+            "notify_email",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
 
         for name in TEXT_FIELDS:
             _ensure_column(
@@ -2212,6 +2224,16 @@ def _user_from_row(row: sqlite3.Row) -> dict:
             if "notify_activity" in keys
             else 0
         ),
+        "email": (
+            str(row["email"] or "")
+            if "email" in keys
+            else ""
+        ),
+        "notify_email": (
+            int(row["notify_email"] or 0)
+            if "notify_email" in keys
+            else 0
+        ),
     }
 
 
@@ -2451,6 +2473,82 @@ def set_user_notify(telegram_id: int, enabled: bool) -> bool:
         updated = cursor.rowcount > 0
         connection.close()
     return updated
+
+
+def parse_yandex_email(raw: str | None) -> str | None:
+    text = (raw or "").strip().casefold()
+    if text in {"-", "нет", "удалить", "убрать"}:
+        return ""
+    if not text.endswith("@yandex.ru"):
+        return None
+    local = text[: -len("@yandex.ru")]
+    if not local or any(ch.isspace() for ch in local):
+        return None
+    return text
+
+
+def set_user_email(telegram_id: int, email: str) -> bool:
+    email = (email or "").strip().casefold()
+    with _lock:
+        connection = _connect()
+        if "email" not in _columns(connection, "users"):
+            connection.close()
+            return False
+        if not email:
+            cursor = connection.execute(
+                """
+                UPDATE users
+                SET email = '', notify_email = 0
+                WHERE telegram_id = ?
+                """,
+                (telegram_id,),
+            )
+        else:
+            cursor = connection.execute(
+                "UPDATE users SET email = ? WHERE telegram_id = ?",
+                (email, telegram_id),
+            )
+        connection.commit()
+        updated = cursor.rowcount > 0
+        connection.close()
+    return updated
+
+
+def set_user_notify_email(telegram_id: int, enabled: bool) -> bool:
+    with _lock:
+        connection = _connect()
+        if "notify_email" not in _columns(connection, "users"):
+            connection.close()
+            return False
+        cursor = connection.execute(
+            "UPDATE users SET notify_email = ? WHERE telegram_id = ?",
+            (1 if enabled else 0, telegram_id),
+        )
+        connection.commit()
+        updated = cursor.rowcount > 0
+        connection.close()
+    return updated
+
+
+def list_email_subscribers() -> list[dict]:
+    with _lock:
+        connection = _connect()
+        columns = _columns(connection, "users")
+        if "notify_email" not in columns or "email" not in columns:
+            connection.close()
+            return []
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE COALESCE(notify_email, 0) = 1
+              AND email IS NOT NULL
+              AND email != ''
+              AND (status = 'active' OR status IS NULL OR status = '')
+            """
+        ).fetchall()
+        connection.close()
+    return [_user_from_row(row) for row in rows]
 
 
 def list_activity_subscribers() -> list[int]:

@@ -1,5 +1,6 @@
 from html import escape
 from io import BytesIO
+import asyncio
 import os
 import time
 
@@ -16,11 +17,18 @@ from telegram.ext import (
     filters,
 )
 
+import mail
 import screens
 import storage
 
 TELEGRAM_BOT_TOKEN = "8628303688:AAFp0DQ19BIYo_g_Gfl2-9Sehhj_uQR82D4"
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
+MAIL_FROM = os.getenv("MAIL_FROM", "botintelnus@mail.ru").strip()
+MAIL_PASSWORD = os.getenv("MAIL_PASSWORD", "apNadc8IPcKi4gfHCJQ3").strip()
+mail.MAIL_FROM = MAIL_FROM
+mail.MAIL_PASSWORD = MAIL_PASSWORD
+mail.MAIL_SMTP_HOST = os.getenv("MAIL_SMTP_HOST", "smtp.mail.ru").strip()
+mail.MAIL_SMTP_PORT = int(os.getenv("MAIL_SMTP_PORT", "2525"))
 
 (
     USER_NAME,
@@ -46,7 +54,8 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
     BUY_DATE,
     BUY_EDIT,
     REQ_DESC,
-) = range(23)
+    USER_EDIT_EMAIL,
+) = range(24)
 
 STOCK_ERROR_TEXT = {
     "not_enough": "Недостаточно на этом месте.",
@@ -69,26 +78,39 @@ _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 _application: Application | None = None
 
 
+async def _send_email_notice(to_email: str, subject: str, html_body: str) -> None:
+    if not mail.configured() or not to_email:
+        return
+    try:
+        await asyncio.to_thread(mail.send_mail, to_email, subject, html_body)
+    except Exception as error:
+        print(f"Не удалось отправить письмо на {to_email}: {error}")
+
+
 async def _flush_activity_notices() -> None:
     events = storage.drain_activity_events()
-    if not events or _application is None:
+    if not events:
         return
     subscribers = storage.list_activity_subscribers()
-    if not subscribers:
+    mail_users = storage.list_email_subscribers()
+    if not subscribers and not mail_users:
         return
-    bot = _application.bot
+    bot = None if _application is None else _application.bot
     for event in events:
         text = screens.activity_notify_text(event)
-        for telegram_id in subscribers:
-            try:
-                await bot.send_message(
-                    chat_id=telegram_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    link_preview_options=_NO_PREVIEW,
-                )
-            except (Forbidden, BadRequest, NetworkError, TimedOut):
-                continue
+        if bot is not None:
+            for telegram_id in subscribers:
+                try:
+                    await bot.send_message(
+                        chat_id=telegram_id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        link_preview_options=_NO_PREVIEW,
+                    )
+                except (Forbidden, BadRequest, NetworkError, TimedOut):
+                    continue
+        for user in mail_users:
+            await _send_email_notice(user.get("email") or "", "Событие", text)
 
 
 async def render(
@@ -962,7 +984,15 @@ async def notify_purchasers(
                 link_preview_options=_NO_PREVIEW,
             )
         except (BadRequest, Forbidden, NetworkError, TimedOut):
-            continue
+            pass
+        user = storage.get_user(telegram_id)
+        if user and user.get("notify_email") and user.get("email"):
+            subject = (
+                f"Новая заявка #{item['id']}"
+                if created
+                else f"Статус заявки #{item['id']}"
+            )
+            await _send_email_notice(user["email"], subject, text)
 
 
 async def _show_check_step(update: Update, inspection: dict | None, pelengator_id: int | None = None) -> int:
@@ -1288,7 +1318,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         storage.set_user_notify(user_id, enabled)
         try:
             await query.answer(
-                "Уведомления включены" if enabled else "Уведомления выключены"
+                "Уведомления в тг включены"
+                if enabled
+                else "Уведомления в тг выключены"
+            )
+        except BadRequest:
+            pass
+        await render_screen(update, _profile(update))
+        return ConversationHandler.END
+    if data == "me:mail":
+        return await start_edit_own_email(update, context)
+    if data == "me:entf":
+        user_id = _viewer_id(update)
+        db_user = None if user_id is None else storage.get_user(user_id)
+        if db_user is None:
+            await render(update, *screens.register_prompt())
+            return USER_NAME
+        if not db_user.get("email"):
+            await query.answer("Сначала укажите почту", show_alert=True)
+            return ConversationHandler.END
+        enabled = not bool(db_user.get("notify_email"))
+        storage.set_user_notify_email(user_id, enabled)
+        try:
+            await query.answer(
+                "Письма включены" if enabled else "Письма выключены"
             )
         except BadRequest:
             pass
@@ -2323,6 +2376,54 @@ async def user_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 @need_user
+async def start_edit_own_email(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    user_id = _viewer_id(update)
+    db_user = None if user_id is None else storage.get_user(user_id)
+    if db_user is None:
+        await render(update, *screens.register_prompt())
+        return USER_NAME
+    current = db_user.get("email") or "—"
+    context.user_data["cancel_back"] = "nav:profile"
+    await render(
+        update,
+        *_ask(
+            context,
+            "Почта Яндекса, например <code>name@yandex.ru</code>.\n"
+            f"Сейчас: <code>{escape(current)}</code>\n\n"
+            "Чтобы убрать, напишите <code>удалить</code>.",
+        ),
+    )
+    return USER_EDIT_EMAIL
+
+
+async def user_edit_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    parsed = storage.parse_yandex_email(
+        update.message.text if update.message else None
+    )
+    user = update.effective_user
+    if parsed is None:
+        await render(
+            update,
+            *_ask(
+                context,
+                "Нужен адрес вида <code>name@yandex.ru</code>. "
+                "Либо напишите <code>удалить</code>.",
+            ),
+            as_new=True,
+        )
+        return USER_EDIT_EMAIL
+    if user is None:
+        return ConversationHandler.END
+    storage.set_user_email(user.id, parsed)
+    context.user_data.clear()
+    await render_screen(update, _profile(update), as_new=True)
+    return ConversationHandler.END
+
+
+@need_user
 async def start_edit_pel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _, _, pelengator_id, field = update.callback_query.data.split(":", 3)
     pelengator_id = int(pelengator_id)
@@ -3328,6 +3429,7 @@ def main() -> None:
             CallbackQueryHandler(start_error_description, pattern=r"^err:np:"),
             CallbackQueryHandler(start_edit_error, pattern=r"^err:e:"),
             CallbackQueryHandler(start_edit_own_name, pattern=r"^me:name$"),
+            CallbackQueryHandler(start_edit_own_email, pattern=r"^me:mail$"),
             CallbackQueryHandler(on_stock_callback, pattern=r"^stk:"),
             CallbackQueryHandler(start_logs_time, pattern=r"^logs:tc$"),
             CallbackQueryHandler(start_logs_pels_filter, pattern=r"^logs:fk:pels$"),
@@ -3340,6 +3442,9 @@ def main() -> None:
             USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_reg_name)],
             USER_EDIT_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, user_edit_name)
+            ],
+            USER_EDIT_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, user_edit_email)
             ],
             TYPE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, type_name)],
             TYPE_EDIT_VALUE: [
@@ -3407,6 +3512,8 @@ def main() -> None:
     print("Бот запущен!")
     if not TELEGRAM_PROXY:
         print("Если нет связи с Telegram — включите VPN или задайте TELEGRAM_PROXY.")
+    if not mail.configured():
+        print("Почта не настроена: задайте MAIL_FROM и MAIL_PASSWORD.")
     try:
         app.run_polling(bootstrap_retries=-1)
     except (TimedOut, NetworkError) as error:
