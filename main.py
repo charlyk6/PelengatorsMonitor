@@ -17,18 +17,12 @@ from telegram.ext import (
     filters,
 )
 
-import mail
 import screens
 import storage
+import vedomost
 
 TELEGRAM_BOT_TOKEN = "8628303688:AAFp0DQ19BIYo_g_Gfl2-9Sehhj_uQR82D4"
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
-MAIL_FROM = os.getenv("MAIL_FROM", "botintelnus@mail.ru").strip()
-MAIL_PASSWORD = os.getenv("MAIL_PASSWORD", "apNadc8IPcKi4gfHCJQ3").strip()
-mail.MAIL_FROM = MAIL_FROM
-mail.MAIL_PASSWORD = MAIL_PASSWORD
-mail.MAIL_SMTP_HOST = os.getenv("MAIL_SMTP_HOST", "smtp.mail.ru").strip()
-mail.MAIL_SMTP_PORT = int(os.getenv("MAIL_SMTP_PORT", "2525"))
 
 (
     USER_NAME,
@@ -54,8 +48,7 @@ mail.MAIL_SMTP_PORT = int(os.getenv("MAIL_SMTP_PORT", "2525"))
     BUY_DATE,
     BUY_EDIT,
     REQ_DESC,
-    USER_EDIT_EMAIL,
-) = range(24)
+) = range(23)
 
 STOCK_ERROR_TEXT = {
     "not_enough": "Недостаточно на этом месте.",
@@ -78,39 +71,28 @@ _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 _application: Application | None = None
 
 
-async def _send_email_notice(to_email: str, subject: str, html_body: str) -> None:
-    if not mail.configured() or not to_email:
-        return
-    try:
-        await asyncio.to_thread(mail.send_mail, to_email, subject, html_body)
-    except Exception as error:
-        print(f"Не удалось отправить письмо на {to_email}: {error}")
-
-
 async def _flush_activity_notices() -> None:
     events = storage.drain_activity_events()
     if not events:
         return
     subscribers = storage.list_activity_subscribers()
-    mail_users = storage.list_email_subscribers()
-    if not subscribers and not mail_users:
+    if not subscribers:
         return
     bot = None if _application is None else _application.bot
+    if bot is None:
+        return
     for event in events:
         text = screens.activity_notify_text(event)
-        if bot is not None:
-            for telegram_id in subscribers:
-                try:
-                    await bot.send_message(
-                        chat_id=telegram_id,
-                        text=text,
-                        parse_mode=ParseMode.HTML,
-                        link_preview_options=_NO_PREVIEW,
-                    )
-                except (Forbidden, BadRequest, NetworkError, TimedOut):
-                    continue
-        for user in mail_users:
-            await _send_email_notice(user.get("email") or "", "Событие", text)
+        for telegram_id in subscribers:
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    link_preview_options=_NO_PREVIEW,
+                )
+            except (Forbidden, BadRequest, NetworkError, TimedOut):
+                continue
 
 
 async def render(
@@ -862,6 +844,166 @@ async def decide_log_request(
     return ConversationHandler.END
 
 
+async def _deliver_vedomost(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    *,
+    caption: str = "Ведомость учёта пеленгаторов",
+) -> bool:
+    try:
+        payload, filename = await asyncio.to_thread(vedomost.export_vedomost)
+    except Exception as error:
+        print(f"Не удалось сформировать ведомость: {error}")
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text="Не удалось сформировать ведомость. Попробуйте позже.",
+            )
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            pass
+        return False
+    try:
+        await context.bot.send_document(
+            chat_id=telegram_id,
+            document=InputFile(payload, filename=filename),
+            caption=caption,
+        )
+    except (BadRequest, Forbidden, NetworkError, TimedOut):
+        return False
+    return True
+
+
+async def notify_admins_export_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    request: dict,
+    *,
+    except_id: int | None = None,
+) -> int:
+    text = screens.export_request_admin_text(request)
+    markup = screens.export_request_admin_markup(request["id"])
+    sent = 0
+    for admin in storage.list_admins():
+        if except_id is not None and admin["telegram_id"] == except_id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=admin["telegram_id"],
+                text=text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=_NO_PREVIEW,
+            )
+            sent += 1
+        except (BadRequest, Forbidden, NetworkError, TimedOut):
+            continue
+    return sent
+
+
+async def submit_export_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    user_id = _viewer_id(update)
+    if user_id is None:
+        return ConversationHandler.END
+    request = storage.create_export_request(user_id, _booking_label(update))
+    sent = await notify_admins_export_request(context, request, except_id=user_id)
+    await render(update, *screens.export_request_sent_screen(no_admins=not sent))
+    return ConversationHandler.END
+
+
+async def decide_export_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    approved: bool,
+) -> int:
+    query = update.callback_query
+    data = "" if query is None or not query.data else query.data
+    try:
+        request_id = int(data.split(":")[2])
+    except (IndexError, ValueError):
+        return ConversationHandler.END
+    status = "approved" if approved else "denied"
+    request = storage.set_export_request_status(request_id, status)
+    if request is None:
+        if query is not None:
+            try:
+                await query.answer("Запрос уже обработан", show_alert=True)
+            except BadRequest:
+                pass
+        await render(update, *screens.export_request_done_screen(already=True))
+        return ConversationHandler.END
+    if approved:
+        if query is not None:
+            try:
+                await query.answer("Ведомость выдана")
+            except BadRequest:
+                pass
+        await render(update, *screens.export_request_done_screen(approved=True))
+        await _deliver_vedomost(
+            context,
+            request["requester_id"],
+            caption="Ведомость учёта пеленгаторов по запросу",
+        )
+    else:
+        if query is not None:
+            try:
+                await query.answer("Запрос отклонён")
+            except BadRequest:
+                pass
+        await render(update, *screens.export_request_done_screen(approved=False))
+        await _notify_user(
+            context,
+            request["requester_id"],
+            "Администратор отклонил запрос на экспорт ведомости.",
+        )
+    return ConversationHandler.END
+
+
+async def on_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = "" if query is None or not query.data else query.data
+    if _is_purchaser(update) and data == "nav:export":
+        if query is not None:
+            try:
+                await query.answer("Недоступно для закупщика", show_alert=True)
+            except BadRequest:
+                pass
+        return ConversationHandler.END
+    if data == "nav:export":
+        if _is_admin(update):
+            if query is not None:
+                try:
+                    await query.answer("Формирую ведомость")
+                except BadRequest:
+                    pass
+            user_id = _viewer_id(update)
+            if user_id is not None:
+                await _deliver_vedomost(context, user_id)
+            return ConversationHandler.END
+        return await submit_export_request(update, context)
+    if data.startswith("exp:ya:"):
+        if not _is_admin(update):
+            if query is not None:
+                try:
+                    await query.answer("Только администратор", show_alert=True)
+                except BadRequest:
+                    pass
+            return ConversationHandler.END
+        return await decide_export_request(update, context, approved=True)
+    if data.startswith("exp:na:"):
+        if not _is_admin(update):
+            if query is not None:
+                try:
+                    await query.answer("Только администратор", show_alert=True)
+                except BadRequest:
+                    pass
+            return ConversationHandler.END
+        return await decide_export_request(update, context, approved=False)
+    return ConversationHandler.END
+
+
 def need_user(handler):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -989,23 +1131,6 @@ async def notify_purchasers(
             )
         except (BadRequest, Forbidden, NetworkError, TimedOut):
             pass
-    subject = (
-        f"Новая заявка #{item['id']}"
-        if created
-        else f"Статус заявки #{item['id']}"
-    )
-    mailed: set[str] = set()
-    for user in storage.list_email_subscribers():
-        address = (user.get("email") or "").strip()
-        if not address or address in mailed:
-            continue
-        mailed.add(address)
-        text = screens.request_notify_text(
-            item,
-            created=created,
-            for_author=int(user["telegram_id"]) == int(item["created_by"]),
-        )
-        await _send_email_notice(address, subject, text)
 
 
 async def _show_check_step(update: Update, inspection: dict | None, pelengator_id: int | None = None) -> int:
@@ -1319,6 +1444,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     if data == "nav:logs" or data.startswith("logs:"):
         return await on_logs_callback(update, context)
+    if data == "nav:export" or data.startswith("exp:"):
+        return await on_export(update, context)
     if data == "me:name":
         return await start_edit_own_name(update, context)
     if data == "me:ntf":
@@ -1331,30 +1458,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         storage.set_user_notify(user_id, enabled)
         try:
             await query.answer(
-                "Уведомления в тг включены"
+                "Уведомления включены"
                 if enabled
-                else "Уведомления в тг выключены"
-            )
-        except BadRequest:
-            pass
-        await render_screen(update, _profile(update))
-        return ConversationHandler.END
-    if data == "me:mail":
-        return await start_edit_own_email(update, context)
-    if data == "me:entf":
-        user_id = _viewer_id(update)
-        db_user = None if user_id is None else storage.get_user(user_id)
-        if db_user is None:
-            await render(update, *screens.register_prompt())
-            return USER_NAME
-        if not db_user.get("email"):
-            await query.answer("Сначала укажите почту", show_alert=True)
-            return ConversationHandler.END
-        enabled = not bool(db_user.get("notify_email"))
-        storage.set_user_notify_email(user_id, enabled)
-        try:
-            await query.answer(
-                "Письма включены" if enabled else "Письма выключены"
+                else "Уведомления выключены"
             )
         except BadRequest:
             pass
@@ -2389,54 +2495,6 @@ async def user_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 @need_user
-async def start_edit_own_email(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> int:
-    user_id = _viewer_id(update)
-    db_user = None if user_id is None else storage.get_user(user_id)
-    if db_user is None:
-        await render(update, *screens.register_prompt())
-        return USER_NAME
-    current = db_user.get("email") or "—"
-    context.user_data["cancel_back"] = "nav:profile"
-    await render(
-        update,
-        *_ask(
-            context,
-            "Введите почту, например <code>name@mail.ru</code>.\n"
-            f"Сейчас: <code>{escape(current)}</code>\n\n"
-            "Чтобы убрать, напишите <code>удалить</code>.",
-        ),
-    )
-    return USER_EDIT_EMAIL
-
-
-async def user_edit_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    parsed = storage.parse_email(
-        update.message.text if update.message else None
-    )
-    user = update.effective_user
-    if parsed is None:
-        await render(
-            update,
-            *_ask(
-                context,
-                "Нужен адрес вида <code>name@mail.ru</code>. "
-                "Либо напишите <code>удалить</code>.",
-            ),
-            as_new=True,
-        )
-        return USER_EDIT_EMAIL
-    if user is None:
-        return ConversationHandler.END
-    storage.set_user_email(user.id, parsed)
-    context.user_data.clear()
-    await render_screen(update, _profile(update), as_new=True)
-    return ConversationHandler.END
-
-
-@need_user
 async def start_edit_pel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _, _, pelengator_id, field = update.callback_query.data.split(":", 3)
     pelengator_id = int(pelengator_id)
@@ -3442,7 +3500,6 @@ def main() -> None:
             CallbackQueryHandler(start_error_description, pattern=r"^err:np:"),
             CallbackQueryHandler(start_edit_error, pattern=r"^err:e:"),
             CallbackQueryHandler(start_edit_own_name, pattern=r"^me:name$"),
-            CallbackQueryHandler(start_edit_own_email, pattern=r"^me:mail$"),
             CallbackQueryHandler(on_stock_callback, pattern=r"^stk:"),
             CallbackQueryHandler(start_logs_time, pattern=r"^logs:tc$"),
             CallbackQueryHandler(start_logs_pels_filter, pattern=r"^logs:fk:pels$"),
@@ -3455,9 +3512,6 @@ def main() -> None:
             USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_reg_name)],
             USER_EDIT_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, user_edit_name)
-            ],
-            USER_EDIT_EMAIL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, user_edit_email)
             ],
             TYPE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, type_name)],
             TYPE_EDIT_VALUE: [
@@ -3525,8 +3579,6 @@ def main() -> None:
     print("Бот запущен!")
     if not TELEGRAM_PROXY:
         print("Если нет связи с Telegram — включите VPN или задайте TELEGRAM_PROXY.")
-    if not mail.configured():
-        print("Почта не настроена: задайте MAIL_FROM и MAIL_PASSWORD.")
     try:
         app.run_polling(bootstrap_retries=-1)
     except (TimedOut, NetworkError) as error:

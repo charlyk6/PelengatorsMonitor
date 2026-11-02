@@ -541,6 +541,14 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'pending'
             );
 
+            CREATE TABLE IF NOT EXISTS export_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                requester_id INTEGER NOT NULL,
+                requester_name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+
             CREATE TABLE IF NOT EXISTS purchases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -593,18 +601,6 @@ def init_db() -> None:
             connection,
             "users",
             "notify_activity",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        _ensure_column(
-            connection,
-            "users",
-            "email",
-            "TEXT NOT NULL DEFAULT ''",
-        )
-        _ensure_column(
-            connection,
-            "users",
-            "notify_email",
             "INTEGER NOT NULL DEFAULT 0",
         )
 
@@ -848,6 +844,21 @@ def parse_pelengator_id(raw: str) -> int | None:
     if value < 1 or value > MAX_PELENGATOR_ID:
         return None
     return value
+
+
+def format_pelengator_number(pelengator_id: int) -> str:
+    value = int(pelengator_id)
+    if value >= 1_000_000:
+        digits = f"{value:09d}"
+        return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
+    return str(value)
+
+
+def pelengator_batch(pelengator_id: int) -> str:
+    value = int(pelengator_id)
+    if value >= 1_000_000:
+        return f"{value:09d}"[2:5]
+    return ""
 
 
 def parse_purchase_id(raw: str) -> int | None:
@@ -2058,6 +2069,133 @@ def cancel_inspection(inspection_id: int) -> int | None:
     return pelengator_id
 
 
+def get_vedomost_snapshot() -> dict:
+    """Один SQL-запрос: типы, актуальные пеленгаторы, последняя проверка и ошибки."""
+    type_cols = [
+        f"t.{field} AS type_{field}" for field in (*TEXT_FIELDS, *FLAG_FIELDS)
+    ]
+    pel_cols = [
+        f"p.{field} AS pel_{field}" for field in (*TEXT_FIELDS, *FLAG_FIELDS)
+    ]
+    sql = f"""
+        SELECT
+            t.id AS type_id,
+            t.name AS type_name,
+            COALESCE(t.is_archive, 0) AS type_is_archive,
+            {", ".join(type_cols)},
+            p.id AS pel_id,
+            p.location AS pel_location,
+            p.reserved AS pel_reserved,
+            {", ".join(pel_cols)},
+            i.started_at AS insp_started_at,
+            i.finished_at AS insp_finished_at,
+            i.status AS insp_status,
+            (
+                SELECT json_group_array(json_object(
+                    'id', e.id,
+                    'kind', e.kind,
+                    'priority', COALESCE(e.priority, 'medium'),
+                    'hw_class', COALESCE(e.hw_class, ''),
+                    'hw_part', COALESCE(e.hw_part, ''),
+                    'description', COALESCE(e.description, '')
+                ))
+                FROM errors e
+                WHERE e.pelengator_id = p.id
+                  AND COALESCE(e.is_deleted, 0) = 0
+            ) AS errors_json
+        FROM pelengator_types t
+        LEFT JOIN pelengators p
+            ON p.type_id = t.id
+           AND COALESCE(p.is_archived, 0) = 0
+        LEFT JOIN inspections i
+            ON i.id = (
+                SELECT id FROM inspections
+                WHERE pelengator_id = p.id
+                  AND status IS NOT NULL
+                  AND status != 'in_progress'
+                ORDER BY id DESC
+                LIMIT 1
+            )
+        ORDER BY t.id, p.id
+    """
+    with _lock:
+        connection = _connect()
+        rows = connection.execute(sql).fetchall()
+        connection.close()
+
+    types: dict[int, dict] = {}
+    order: list[int] = []
+    for row in rows:
+        type_id = int(row["type_id"])
+        if type_id not in types:
+            values: dict = {}
+            for field in TEXT_FIELDS:
+                raw = row[f"type_{field}"]
+                values[field] = "" if raw is None else str(raw)
+            for field in FLAG_FIELDS:
+                raw = row[f"type_{field}"]
+                values[field] = 0 if raw is None else int(raw)
+            types[type_id] = {
+                "id": type_id,
+                "name": str(row["type_name"] or ""),
+                "is_archive": int(row["type_is_archive"] or 0),
+                "values": values,
+                "devices": [],
+            }
+            order.append(type_id)
+        if row["pel_id"] is None:
+            continue
+        pel_id = int(row["pel_id"])
+        pel_values: dict = {}
+        for field in TEXT_FIELDS:
+            raw = row[f"pel_{field}"]
+            pel_values[field] = "" if raw is None else str(raw)
+        for field in FLAG_FIELDS:
+            raw = row[f"pel_{field}"]
+            pel_values[field] = 0 if raw is None else int(raw)
+        raw_errors = row["errors_json"]
+        try:
+            errors = json.loads(raw_errors) if raw_errors else []
+        except (TypeError, json.JSONDecodeError):
+            errors = []
+        if not isinstance(errors, list):
+            errors = []
+        parsed_errors = []
+        for item in errors:
+            if not isinstance(item, dict):
+                continue
+            parsed_errors.append(
+                {
+                    "id": int(item.get("id") or 0),
+                    "pelengator_id": pel_id,
+                    "kind": str(item.get("kind") or "soft"),
+                    "priority": str(item.get("priority") or DEFAULT_PRIORITY),
+                    "hw_class": str(item.get("hw_class") or ""),
+                    "hw_part": str(item.get("hw_part") or ""),
+                    "description": str(item.get("description") or ""),
+                }
+            )
+        parsed_errors.sort(key=_error_sort_key)
+        types[type_id]["devices"].append(
+            {
+                "id": pel_id,
+                "number": format_pelengator_number(pel_id),
+                "batch": pelengator_batch(pel_id),
+                "location": "" if row["pel_location"] is None else str(row["pel_location"]),
+                "reserved": "" if row["pel_reserved"] is None else str(row["pel_reserved"]),
+                "insp_started_at": str(row["insp_started_at"] or ""),
+                "insp_finished_at": str(row["insp_finished_at"] or ""),
+                "insp_status": str(row["insp_status"] or ""),
+                "values": pel_values,
+                "errors": parsed_errors,
+            }
+        )
+    return {
+        "generated_at": _now_iso(),
+        "types": [types[type_id] for type_id in order],
+    }
+
+
 def list_errors_for_pelengator(pelengator_id: int) -> list[dict]:
     with _lock:
         connection = _connect()
@@ -2222,16 +2360,6 @@ def _user_from_row(row: sqlite3.Row) -> dict:
         "notify_activity": (
             int(row["notify_activity"] or 0)
             if "notify_activity" in keys
-            else 0
-        ),
-        "email": (
-            str(row["email"] or "")
-            if "email" in keys
-            else ""
-        ),
-        "notify_email": (
-            int(row["notify_email"] or 0)
-            if "notify_email" in keys
             else 0
         ),
     }
@@ -2475,82 +2603,6 @@ def set_user_notify(telegram_id: int, enabled: bool) -> bool:
     return updated
 
 
-def parse_email(raw: str | None) -> str | None:
-    text = (raw or "").strip().casefold()
-    if text in {"-", "нет", "удалить", "убрать"}:
-        return ""
-    if text.count("@") != 1 or any(ch.isspace() for ch in text):
-        return None
-    local, domain = text.split("@", 1)
-    if not local or not domain or "." not in domain or domain.startswith(".") or domain.endswith("."):
-        return None
-    return text
-
-
-def set_user_email(telegram_id: int, email: str) -> bool:
-    email = (email or "").strip().casefold()
-    with _lock:
-        connection = _connect()
-        if "email" not in _columns(connection, "users"):
-            connection.close()
-            return False
-        if not email:
-            cursor = connection.execute(
-                """
-                UPDATE users
-                SET email = '', notify_email = 0
-                WHERE telegram_id = ?
-                """,
-                (telegram_id,),
-            )
-        else:
-            cursor = connection.execute(
-                "UPDATE users SET email = ? WHERE telegram_id = ?",
-                (email, telegram_id),
-            )
-        connection.commit()
-        updated = cursor.rowcount > 0
-        connection.close()
-    return updated
-
-
-def set_user_notify_email(telegram_id: int, enabled: bool) -> bool:
-    with _lock:
-        connection = _connect()
-        if "notify_email" not in _columns(connection, "users"):
-            connection.close()
-            return False
-        cursor = connection.execute(
-            "UPDATE users SET notify_email = ? WHERE telegram_id = ?",
-            (1 if enabled else 0, telegram_id),
-        )
-        connection.commit()
-        updated = cursor.rowcount > 0
-        connection.close()
-    return updated
-
-
-def list_email_subscribers() -> list[dict]:
-    with _lock:
-        connection = _connect()
-        columns = _columns(connection, "users")
-        if "notify_email" not in columns or "email" not in columns:
-            connection.close()
-            return []
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE COALESCE(notify_email, 0) = 1
-              AND email IS NOT NULL
-              AND email != ''
-              AND (status = 'active' OR status IS NULL OR status = '')
-            """
-        ).fetchall()
-        connection.close()
-    return [_user_from_row(row) for row in rows]
-
-
 def list_activity_subscribers() -> list[int]:
     with _lock:
         connection = _connect()
@@ -2661,6 +2713,87 @@ def set_log_request_status(request_id: int, status: str) -> dict | None:
         ).fetchone()
         connection.close()
     return None if updated is None else _log_request_from_row(updated)
+
+
+def _export_request_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "id": int(row["id"]),
+        "created_at": str(row["created_at"] or ""),
+        "requester_id": int(row["requester_id"]),
+        "requester_name": str(row["requester_name"] or ""),
+        "status": str(row["status"] or "pending"),
+    }
+
+
+def create_export_request(requester_id: int, requester_name: str) -> dict:
+    with _lock:
+        connection = _connect()
+        connection.execute(
+            """
+            UPDATE export_requests
+            SET status = 'cancelled'
+            WHERE requester_id = ? AND status = 'pending'
+            """,
+            (requester_id,),
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO export_requests (
+                created_at, requester_id, requester_name, status
+            ) VALUES (?, ?, ?, 'pending')
+            """,
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                requester_id,
+                requester_name or "",
+            ),
+        )
+        request_id = int(cursor.lastrowid)
+        row = connection.execute(
+            "SELECT * FROM export_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.commit()
+        connection.close()
+    return _export_request_from_row(row)
+
+
+def get_export_request(request_id: int) -> dict | None:
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM export_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.close()
+    if row is None:
+        return None
+    return _export_request_from_row(row)
+
+
+def set_export_request_status(request_id: int, status: str) -> dict | None:
+    if status not in ("approved", "denied", "cancelled"):
+        return None
+    with _lock:
+        connection = _connect()
+        row = connection.execute(
+            "SELECT * FROM export_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None or str(row["status"] or "") != "pending":
+            connection.close()
+            return None
+        connection.execute(
+            "UPDATE export_requests SET status = ? WHERE id = ?",
+            (status, request_id),
+        )
+        connection.commit()
+        updated = connection.execute(
+            "SELECT * FROM export_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        connection.close()
+    return None if updated is None else _export_request_from_row(updated)
 
 
 MAX_STOCK_QTY = 1_000_000

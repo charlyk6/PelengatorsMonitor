@@ -259,6 +259,7 @@ def home_screen(
             _btn("＋ Заявка", "req:add"),
             _btn("Мои заявки", "nav:reqs"),
         ],
+        [_btn("📄 Экспорт", "nav:export")],
     ]
     if role in ("owner", "admin"):
         rows.append([_btn("Пользователи", "nav:users")])
@@ -1465,34 +1466,22 @@ ROLE_LABEL = storage.ROLE_LABELS
 
 def profile_screen(user: dict) -> tuple[str, InlineKeyboardMarkup]:
     role = storage.ROLE_LABELS.get(user.get("role") or "worker", "Работник")
-    email = user.get("email") or ""
     text = (
         "<b>Профиль</b>\n\n"
         f"<b>Имя:</b> {escape(user.get('name') or '—')}\n"
-        f"<b>Роль:</b> {escape(role)}\n"
-        f"<b>Почта:</b> {escape(email) if email else '—'}"
+        f"<b>Роль:</b> {escape(role)}"
     )
     keyboard = _markup(
         [
             [_btn("Сменить имя", "me:name")],
-            [_btn("Почта", "me:mail")],
             [_btn("Логи", "nav:logs")],
             [
                 _btn(
                     _check_label(
                         bool(user.get("notify_activity")),
-                        "Уведомления в тг",
+                        "Уведомления",
                     ),
                     "me:ntf",
-                )
-            ],
-            [
-                _btn(
-                    _check_label(
-                        bool(user.get("notify_email")),
-                        "Уведомления на почту",
-                    ),
-                    "me:entf",
                 )
             ],
             [_btn("← Меню", "nav:home")],
@@ -1785,6 +1774,55 @@ def log_request_admin_markup(request_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def export_request_sent_screen(*, no_admins: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    if no_admins:
+        text = (
+            "<b>Экспорт ведомости</b>\n\n"
+            "Сейчас нет доступных администраторов. Попробуйте позже.\n"
+            "Запрос сохранён и будет ждать подтверждения."
+        )
+    else:
+        text = (
+            "<b>Запрос отправлен</b>\n\n"
+            "Администратор получит его и после подтверждения пришлёт файл ведомости."
+        )
+    return text, _markup([[_btn("← Меню", "nav:home")]])
+
+
+def export_request_admin_text(request: dict) -> str:
+    name = escape(request.get("requester_name") or "пользователь")
+    return (
+        "<b>Запрос экспорта</b>\n\n"
+        f"{name} просит ведомость учёта пеленгаторов.\n\n"
+        "<i>Выдать файл или отказать.</i>"
+    )
+
+
+def export_request_admin_markup(request_id: int) -> InlineKeyboardMarkup:
+    return _markup(
+        [
+            [
+                _btn("Выдать", f"exp:ya:{request_id}"),
+                _btn("Отказать", f"exp:na:{request_id}"),
+            ]
+        ]
+    )
+
+
+def export_request_done_screen(
+    *,
+    approved: bool = False,
+    already: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
+    if already:
+        text = "Этот запрос уже обработан."
+    elif approved:
+        text = "Ведомость выдана пользователю."
+    else:
+        text = "Запрос на экспорт отклонён."
+    return text, _markup([])
 
 
 def activity_event_plain(item: dict) -> str:
